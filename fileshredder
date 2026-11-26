@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-# shredder_touch_fixed_no_flash.py
-# Fix: replace stdscr.clear() → stdscr.erase() + state dirty flag to reduce redraw
+# fileshredder.py
+# ✅ 镂空检测：目录/文件不存在时不再抛异常退出，状态栏提示 + 自动回退最近可用父目录
+# ✅ 保留：中文输入 / Termux 触屏点击与滚动 / 动态底部按钮 / erase+dirty 防闪烁 / :select 多条件
 import curses
 import os
 import secrets
@@ -9,6 +10,7 @@ import subprocess
 import re
 import shlex
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 import select
@@ -19,89 +21,133 @@ PAT_MTIME_OLD = re.compile(r"([+-]?\d+)")
 PAT_SIZE_INTERVAL = re.compile(r"\[(.*?),(.*?)\]")
 PAT_MDATE = re.compile(r"([<>]?=?)(\d{4}-\d{2}-\d{2})")
 
-def shred_single_file_python(file_path, passes=2, chunk_size=1024*1024):
+
+def shred_single_file_python(file_path, passes=2, chunk_size=1024 * 1024):
     if not os.path.isfile(file_path):
-        yield (0, "skip:not a file"); return
+        yield (0, "skip:not a file")
+        return
     try:
         file_size = os.path.getsize(file_path)
         if file_size == 0:
-            os.remove(file_path); yield (100, "OK:empty removed"); return
+            os.remove(file_path)
+            yield (100, "OK:empty removed")
+            return
         with open(file_path, "r+b") as f:
             for pass_no in range(passes):
-                f.seek(0); written = 0
+                f.seek(0)
+                written = 0
                 while written < file_size:
                     to_write = min(chunk_size, file_size - written)
-                    f.write(secrets.token_bytes(to_write)); written += to_write
-                    yield (int(written/file_size*100), f"Pass {pass_no+1}/{passes} writing")
-                f.flush(); os.fsync(f.fileno())
-        os.remove(file_path); yield (100, "✅ File shredded & deleted")
+                    f.write(secrets.token_bytes(to_write))
+                    written += to_write
+                    yield (int(written / file_size * 100), f"Pass {pass_no + 1}/{passes} writing")
+                f.flush()
+                os.fsync(f.fileno())
+        os.remove(file_path)
+        yield (100, "✅ File shredded & deleted")
+    except FileNotFoundError:
+        yield (-1, "❌ 文件已不存在，已跳过")
     except PermissionError:
         yield (-1, "❌ Permission denied")
     except Exception as e:
         yield (-1, f"❌ Error:{str(e)}")
 
-def shred_single_file_system(file_path, passes=2, chunk_size=1024*1024):
+
+def shred_single_file_system(file_path, passes=2, chunk_size=1024 * 1024):
     if not os.path.isfile(file_path):
-        yield (0, "skip:not a file"); return
+        yield (0, "skip:not a file")
+        return
     try:
         if os.path.getsize(file_path) == 0:
-            os.remove(file_path); yield (100, "OK:empty removed"); return
+            os.remove(file_path)
+            yield (100, "OK:empty removed")
+            return
         proc = subprocess.Popen(
             ["shred", f"-n{passes}", "-u", "-z", "-v", file_path],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, text=True)
         yield (0, f"Start shred pass={passes} (+zero pass)")
         while proc.poll() is None:
             line = proc.stderr.readline()
-            if not line: continue
+            if not line:
+                continue
             m = PAT_PASS.search(line)
             if m:
                 p_no, p_total = int(m.group(1)), int(m.group(2))
-                yield (int(p_no/p_total*100), f"Pass {p_no}/{p_total} writing")
-        ret = proc.wait(); proc.stderr.read(); proc.stdout.read()
-        if ret == 0: yield (100, "✅ File shredded & deleted")
-        else: yield (-1, f"❌ shred exited code {ret}")
+                yield (int(p_no / p_total * 100), f"Pass {p_no}/{p_total} writing")
+        ret = proc.wait()
+        proc.stderr.read()
+        proc.stdout.read()
+        if ret == 0:
+            yield (100, "✅ File shredded & deleted")
+        else:
+            yield (-1, f"❌ shred exited code {ret}")
     except FileNotFoundError:
-        yield (-1, "❌ ERROR: shred not found, run pkg install coreutils")
+        yield (-1, "❌ shred 命令未找到，请 pkg install coreutils")
     except PermissionError:
         yield (-1, "❌ Permission denied")
     except Exception as e:
         yield (-1, f"❌ Error:{str(e)}")
 
-def shred_single_file(file_path, passes=2, chunk_size=1024*1024):
+
+def shred_single_file(file_path, passes=2, chunk_size=1024 * 1024):
     if USE_SYSTEM_SHRED:
         yield from shred_single_file_system(file_path, passes, chunk_size)
     else:
         yield from shred_single_file_python(file_path, passes, chunk_size)
 
+
 def collect_all_files(target_path):
-    out, p = [], Path(target_path)
-    if p.is_file(): return [str(p)]
-    if p.is_dir():
-        for root, _, files in os.walk(p):
-            for fn in files:
-                out.append(os.path.join(root, fn))
+    """收集目标下全部文件；路径镂空（已不存在）时返回空列表而不是崩溃"""
+    out = []
+    if not target_path:
+        return out
+    try:
+        p = Path(target_path)
+        if not os.path.exists(target_path):
+            return out
+        if p.is_file():
+            return [str(p)]
+        if p.is_dir():
+            for root, _, files in os.walk(p, onerror=lambda e: None):
+                for fn in files:
+                    fp = os.path.join(root, fn)
+                    try:
+                        if os.path.isfile(fp):
+                            out.append(fp)
+                    except OSError:
+                        continue
+    except OSError:
+        pass
     return out
 
-_unit_map = {"K":1024, "M":1024*1024, "G":1024**3}
+
+_unit_map = {"K": 1024, "M": 1024 * 1024, "G": 1024 ** 3}
+
 
 def _parse_size_token(s):
     s = s.strip()
-    if not s: return None
+    if not s:
+        return None
     m = PAT_SIZE_OLD.match(s)
-    if not m: return None
+    if not m:
+        return None
     num, unit = m.groups()
-    return abs(int(num))*_unit_map[unit]
+    return abs(int(num)) * _unit_map[unit]
+
 
 def parse_size_interval_spec(spec):
     m = PAT_SIZE_INTERVAL.match(spec.strip())
-    if not m: return None
+    if not m:
+        return None
     a, b = m.groups()
     return (_parse_size_token(a) if a.strip() else None,
             _parse_size_token(b) if b.strip() else None)
 
+
 def parse_mdate_spec(spec):
     m = PAT_MDATE.match(spec.strip())
-    if not m: return None
+    if not m:
+        return None
     op, datestr = m.groups()
     op = op or "="
     try:
@@ -109,12 +155,30 @@ def parse_mdate_spec(spec):
     except ValueError:
         return None
 
+
 def parse_mtime_spec(spec):
     m = PAT_MTIME_OLD.match(spec.strip())
-    if not m: return None
-    raw = spec.strip(); num = int(m.group(1))
+    if not m:
+        return None
+    raw = spec.strip()
+    num = int(m.group(1))
     op = ">" if raw.startswith("+") else ("<" if raw.startswith("-") else "=")
     return (op, num)
+
+
+def clip(text, maxcols):
+    """按显示宽度裁剪，中文占 2 列，避免 addstr 越界报 ERR"""
+    if maxcols <= 0:
+        return ""
+    out, cols = [], 0
+    for ch in str(text):
+        wch = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if cols + wch > maxcols:
+            break
+        out.append(ch)
+        cols += wch
+    return "".join(out)
+
 
 # ============ RAW stdin reader: UTF-8 chars + ANSI keys + mouse reports ============
 class RawKeyReader:
@@ -128,7 +192,8 @@ class RawKeyReader:
     def read_one(self):
         while self.available():
             c = os.read(self.fd, 1)
-            if not c: return None
+            if not c:
+                return None
             self.buf += c
 
         if not self.buf:
@@ -138,47 +203,54 @@ class RawKeyReader:
 
         # --- Mouse report: ESC [ < button ; x ; y M/m  (1006 mode) ---
         if self.buf.startswith(b"\x1b[<"):
-            end = self.buf.find(b"M")
-            end2 = self.buf.find(b"m")
-            end_candidates = []
-            if end != -1: end_candidates.append(end)
-            if end2 != -1: end_candidates.append(end2)
-            if not end_candidates:
-                return None  # wait rest of report
-            end = min(end_candidates)
+            endM = self.buf.find(b"M")
+            endm = self.buf.find(b"m")
+            cands = [x for x in (endM, endm) if x != -1]
+            if not cands:
+                return None
+            end = min(cands)
             body = self.buf[3:end]
-            self.buf = self.buf[end+1:]
+            pressed = (self.buf[end:end + 1] == b"M")
+            self.buf = self.buf[end + 1:]
             try:
                 parts = body.split(b";")
                 btn, x, y = int(parts[0]), int(parts[1]), int(parts[2])
-                pressed = (self.buf[end] if end < len(self.buf) else b'') == ord("M")
                 return ("MOUSE", btn, x, y, pressed)
             except Exception:
                 return None
 
-        # --- Arrow / other CSI: ESC [ letter ---
+        # --- Arrow / other CSI ---
         if self.buf.startswith(b"\x1b["):
-            if len(self.buf) < 3: return None
-            seq = self.buf[:3]; self.buf = self.buf[3:]
+            if len(self.buf) < 3:
+                return None
+            seq = self.buf[:3]
+            self.buf = self.buf[3:]
             return {b"\x1b[A": "UP", b"\x1b[B": "DOWN",
                     b"\x1b[C": "RIGHT", b"\x1b[D": "LEFT"}.get(seq, "ESC")
 
         if b0 == 27:
-            self.buf = self.buf[1:]; return "ESC"
+            self.buf = self.buf[1:]
+            return "ESC"
         if b0 in (13, 10):
-            self.buf = self.buf[1:]; return "ENTER"
+            self.buf = self.buf[1:]
+            return "ENTER"
         if b0 in (8, 127):
-            self.buf = self.buf[1:]; return "BACKSPACE"
+            self.buf = self.buf[1:]
+            return "BACKSPACE"
 
         if (b0 & 0x80) == 0:
-            ch = self.buf[:1].decode("ascii"); self.buf = self.buf[1:]; return ch
+            ch = self.buf[:1].decode("ascii")
+            self.buf = self.buf[1:]
+            return ch
 
         try:
             s = self.buf.decode("utf-8")
-            ch = s[0]; self.buf = self.buf[len(ch.encode("utf-8")):]
+            ch = s[0]
+            self.buf = self.buf[len(ch.encode("utf-8")):]
             return ch
         except UnicodeDecodeError:
-            return None  # incomplete multibyte, wait
+            return None
+
 
 def tui_main(stdscr):
     curses.curs_set(0)
@@ -193,20 +265,36 @@ def tui_main(stdscr):
     current_pwd = os.path.abspath("/storage/emulated/0/Download/shred_test")
     old_pwd = current_pwd
 
-    original_scan_entries, scan_entries = [], []
-    cursor_idx, selected_set, view_offset = 0, set(), 0
-    search_mode, search_keyword, search_matches, current_match_idx = False, "", [], 0
+    original_scan_entries = []
+    scan_entries = []
+    cursor_idx = 0
+    selected_set = set()
+    view_offset = 0
+    search_mode = False
+    search_keyword = ""
+    search_matches = []
+    current_match_idx = 0
 
-    MODE_LIST, MODE_PREVIEW = "list", "preview"
-    MODE_CONFIRM1, MODE_CONFIRM2 = "confirm1", "confirm2"
-    MODE_SHREDDING, MODE_CMDLINE = "shredding", "cmdline"
+    MODE_LIST = "list"
+    MODE_PREVIEW = "preview"
+    MODE_CONFIRM1 = "confirm1"
+    MODE_CONFIRM2 = "confirm2"
+    MODE_SHREDDING = "shredding"
+    MODE_CMDLINE = "cmdline"
     mode = MODE_LIST
 
-    cmd_buffer, cmd_error = "", ""
-    all_selected_entries, total_file_list = [], []
-    total_file_count = current_global_idx = 0
+    cmd_buffer = ""
+    cmd_error = ""
+    all_selected_entries = []
+    total_file_list = []
+    total_file_count = 0
+    current_global_idx = 0
     current_file_generator = None
-    current_file_status, current_file_pct = "", 0
+    current_file_status = ""
+    current_file_pct = 0
+
+    status_msg = ""
+    dirty = True
 
     btn_defs = [
         ("[Quit]", "quit"),
@@ -216,132 +304,308 @@ def tui_main(stdscr):
     ]
     key_reader = RawKeyReader()
 
-    # ✅ Dirty标记：只有dirty=True才重绘屏幕，空闲循环跳过refresh
-    dirty = True
+    def put(y, x, text, attr=0, maxcols=None):
+        h, w = stdscr.getmaxyx()
+        if y < 0 or y >= h or x < 0 or x >= w:
+            return
+        if maxcols is None:
+            maxcols = w - x - 1
+        try:
+            stdscr.addstr(y, x, clip(text, max(maxcols, 0)), attr)
+        except curses.error:
+            pass
+
+    def set_status(msg):
+        nonlocal status_msg, dirty
+        status_msg = msg
+        dirty = True
+
+    def scan_dir(path):
+        """返回 (entries, err)。目录不可用/已镂空时 err 非空，绝不抛异常。"""
+        entries = []
+        parent_path = os.path.dirname(path.rstrip("/")) or "/"
+        entries.append({"path": parent_path, "name": ".. (GO UP)",
+                        "is_dir": True, "is_parent_link": True})
+        try:
+            names = os.listdir(path)
+        except FileNotFoundError:
+            return None, "路径不存在（可能已被删除或移动）"
+        except NotADirectoryError:
+            return None, "目标不是文件夹"
+        except PermissionError:
+            return None, "无权限访问该目录"
+        except OSError as e:
+            return None, f"无法访问（{getattr(e, 'strerror', None) or e}）"
+
+        for name in sorted(names, key=lambda s: s.lower()):
+            fullp = os.path.join(path, name)
+            try:
+                is_dir = os.path.isdir(fullp)
+                if not is_dir:
+                    # 幽灵条目检测：listdir 之后又被删除的，直接不显示
+                    os.stat(fullp)
+            except OSError:
+                continue
+            entries.append({"path": fullp, "name": name,
+                            "is_dir": is_dir, "is_parent_link": False})
+        return entries, ""
 
     def rescan_directory():
-        nonlocal original_scan_entries, scan_entries, cursor_idx, view_offset, dirty
+        nonlocal original_scan_entries, scan_entries, cursor_idx, view_offset
+        nonlocal current_pwd, status_msg, dirty
+
+        # ① 当前目录镂空检测：逐级向上找最近可用目录
+        fallback_from = None
+        p = current_pwd
+        guard = 0
+        while not os.path.isdir(p) and guard < 256:
+            if fallback_from is None:
+                fallback_from = p
+            parent = os.path.dirname(p.rstrip("/")) or "/"
+            if parent == p:
+                break
+            p = parent
+            guard += 1
+
+        if not os.path.isdir(p):
+            current_pwd = "/"
+            original_scan_entries.clear()
+            original_scan_entries.append({"path": "/", "name": ".. (GO UP)",
+                                          "is_dir": True, "is_parent_link": True})
+            scan_entries = original_scan_entries.copy()
+            cursor_idx = 0
+            view_offset = 0
+            selected_set.clear()
+            set_status(f"路径不存在: {fallback_from or current_pwd}")
+            return
+
+        rollback_note = ""
+        if p != current_pwd:
+            rollback_note = f"原路径已不存在: {fallback_from}"
+            current_pwd = p
+
+        # ② 扫描目录
+        entries, err = scan_dir(current_pwd)
+        if entries is None:
+            parent = os.path.dirname(current_pwd.rstrip("/")) or "/"
+            if parent != current_pwd and os.path.isdir(parent):
+                current_pwd = parent
+                entries, err = scan_dir(current_pwd)
+                if entries is not None:
+                    rollback_note = (rollback_note + "；" if rollback_note else "") + \
+                                    f"{err} → 已回退到 {current_pwd}"
+            if entries is None:
+                current_pwd = "/"
+                original_scan_entries.clear()
+                original_scan_entries.append({"path": "/", "name": ".. (GO UP)",
+                                              "is_dir": True, "is_parent_link": True})
+                scan_entries = original_scan_entries.copy()
+                cursor_idx = 0
+                view_offset = 0
+                selected_set.clear()
+                set_status(f"{err}；已回到根目录")
+                return
+
         original_scan_entries.clear()
-        parent_path = os.path.dirname(current_pwd.rstrip("/"))
-        original_scan_entries.append({"path": parent_path, "name": ".. (GO UP)",
-                                      "is_dir": True, "is_parent_link": True})
-        try:
-            for entry in os.listdir(current_pwd):
-                fullp = os.path.join(current_pwd, entry)
-                original_scan_entries.append({"path": fullp, "name": entry,
-                    "is_dir": os.path.isdir(fullp), "is_parent_link": False})
-        except PermissionError:
-            pass
+        original_scan_entries.extend(entries)
         scan_entries = original_scan_entries.copy()
-        cursor_idx, view_offset = 0, 0
+        cursor_idx = 0
+        view_offset = 0
         selected_set.clear()
+        if rollback_note:
+            set_status(rollback_note)
+        else:
+            status_msg = ""
         dirty = True
+
+    def safe_enter_dir(target):
+        """进入目录前先做镂空检测，失败只提示不崩溃"""
+        nonlocal current_pwd, old_pwd, status_msg, dirty
+        if not target:
+            set_status("路径为空，无法进入")
+            return False
+        if not os.path.exists(target):
+            set_status(f"文件夹不存在或已被删除: {target}")
+            return False
+        if not os.path.isdir(target):
+            set_status(f"目标不是文件夹: {target}")
+            return False
+        try:
+            os.listdir(target)
+        except PermissionError:
+            set_status(f"无权限访问: {target}")
+            return False
+        except OSError as e:
+            set_status(f"无法访问: {target}（{getattr(e, 'strerror', None) or e}）")
+            return False
+        old_pwd = current_pwd
+        current_pwd = target
+        status_msg = ""
+        rescan_directory()
+        return True
 
     def compute_search_matches(kw):
         kw_low = kw.lower()
-        return [i for i, e in enumerate(original_scan_entries) if kw_low in e["name"].lower()] if kw_low else []
+        if not kw_low:
+            return []
+        return [i for i, e in enumerate(original_scan_entries)
+                if kw_low in e["name"].lower()]
+
+    def _scroll_to(idx):
+        nonlocal view_offset, dirty
+        h, _ = stdscr.getmaxyx()
+        max_lines = (h - 1) - 4
+        if max_lines < 1:
+            max_lines = 1
+        if idx < view_offset:
+            view_offset = idx
+        elif idx >= view_offset + max_lines:
+            view_offset = idx - max_lines + 1
+        dirty = True
 
     def goto_next_match():
-        nonlocal cursor_idx, view_offset, current_match_idx, dirty
-        if not search_matches: return
+        nonlocal cursor_idx, current_match_idx
+        if not search_matches:
+            return
         current_match_idx = (current_match_idx + 1) % len(search_matches)
         cursor_idx = search_matches[current_match_idx]
-        h, _ = stdscr.getmaxyx(); max_lines = (h-1)-4
-        view_offset = cursor_idx if cursor_idx < view_offset else (cursor_idx - max_lines + 1) if cursor_idx >= view_offset+max_lines else view_offset
-        dirty = True
+        _scroll_to(cursor_idx)
 
     def goto_prev_match():
-        nonlocal cursor_idx, view_offset, current_match_idx, dirty
-        if not search_matches: return
+        nonlocal cursor_idx, current_match_idx
+        if not search_matches:
+            return
         current_match_idx = (current_match_idx - 1) % len(search_matches)
         cursor_idx = search_matches[current_match_idx]
-        h, _ = stdscr.getmaxyx(); max_lines = (h-1)-4
-        view_offset = cursor_idx if cursor_idx < view_offset else (cursor_idx - max_lines + 1) if cursor_idx >= view_offset+max_lines else view_offset
-        dirty = True
+        _scroll_to(cursor_idx)
 
     def select_invert():
         nonlocal dirty
         for idx, ent in enumerate(original_scan_entries):
-            if ent.get("is_parent_link"): continue
-            selected_set.discard(idx) if idx in selected_set else selected_set.add(idx)
+            if ent.get("is_parent_link"):
+                continue
+            if idx in selected_set:
+                selected_set.discard(idx)
+            else:
+                selected_set.add(idx)
         dirty = True
 
     def select_multi_condition(raw_args):
         nonlocal dirty
-        try: tokens = shlex.split(raw_args)
-        except ValueError: return (0, "parse error: bad quote")
+        try:
+            tokens = shlex.split(raw_args)
+        except ValueError:
+            return (0, "parse error: bad quote")
         name_pattern = want_type = size_interval = mtime_spec = mdate_spec = None
         i = 0
         while i < len(tokens):
             t = tokens[i]
             if t == "-t":
                 i += 1
-                if i >= len(tokens): return (0, "-t need f/d arg")
+                if i >= len(tokens):
+                    return (0, "-t need f/d arg")
                 v = tokens[i].lower()
-                if v in ("f", "d"): want_type = v
-                else: return (0, "-t only accept f or d")
+                if v in ("f", "d"):
+                    want_type = v
+                else:
+                    return (0, "-t only accept f or d")
             elif t == "-size":
                 i += 1
-                if i >= len(tokens): return (0, "-size need [min,max]")
+                if i >= len(tokens):
+                    return (0, "-size need [min,max]")
                 sp = parse_size_interval_spec(tokens[i])
-                if sp is None: return (0, f"bad size spec:{tokens[i]}")
+                if sp is None:
+                    return (0, f"bad size spec:{tokens[i]}")
                 size_interval = sp
             elif t == "-mtime":
                 i += 1
-                if i >= len(tokens): return (0, "-mtime need ±n days")
+                if i >= len(tokens):
+                    return (0, "-mtime need ±n days")
                 mp = parse_mtime_spec(tokens[i])
-                if mp is None: return (0, f"bad mtime spec:{tokens[i]}")
+                if mp is None:
+                    return (0, f"bad mtime spec:{tokens[i]}")
                 mtime_spec = mp
             elif t == "-mdate":
                 i += 1
-                if i >= len(tokens): return (0, "-mdate need >YYYY-MM-DD")
+                if i >= len(tokens):
+                    return (0, "-mdate need >YYYY-MM-DD")
                 md = parse_mdate_spec(tokens[i])
-                if md is None: return (0, f"bad mdate spec:{tokens[i]}")
+                if md is None:
+                    return (0, f"bad mdate spec:{tokens[i]}")
                 mdate_spec = md
             elif not t.startswith("-"):
-                if name_pattern is None: name_pattern = t
-                else: return (0, "multiple name pattern not supported")
+                if name_pattern is None:
+                    name_pattern = t
+                else:
+                    return (0, "multiple name pattern not supported")
             else:
                 return (0, f"unknown flag {t}")
             i += 1
 
-        hit, now = 0, time.time()
+        hit = 0
+        now = time.time()
         for idx, ent in enumerate(original_scan_entries):
-            if ent.get("is_parent_link"): continue
+            if ent.get("is_parent_link"):
+                continue
+            if not os.path.exists(ent["path"]):
+                continue
             ok = True
-            if name_pattern is not None and name_pattern.lower() not in ent["name"].lower(): ok = False
+            if name_pattern is not None and name_pattern.lower() not in ent["name"].lower():
+                ok = False
             if want_type is not None and ok:
-                if want_type == "f" and not os.path.isfile(ent["path"]): ok = False
-                if want_type == "d" and not ent["is_dir"]: ok = False
+                if want_type == "f" and not os.path.isfile(ent["path"]):
+                    ok = False
+                if want_type == "d" and not ent["is_dir"]:
+                    ok = False
             if size_interval is not None and ok:
                 min_b, max_b = size_interval
-                try: sz = os.stat(ent["path"]).st_size
-                except Exception: sz = 0
-                if min_b is not None and sz < min_b: ok = False
-                if max_b is not None and sz > max_b: ok = False
+                try:
+                    sz = os.stat(ent["path"]).st_size
+                except OSError:
+                    ok = False
+                    sz = 0
+                if ok:
+                    if min_b is not None and sz < min_b:
+                        ok = False
+                    if max_b is not None and sz > max_b:
+                        ok = False
             if mtime_spec is not None and ok:
                 op, days = mtime_spec
-                try: dd = (now - os.stat(ent["path"]).st_mtime)/86400.0
-                except Exception: dd = 0
-                if op == ">" and not dd > days: ok = False
-                elif op == "<" and not dd < days: ok = False
+                try:
+                    dd = (now - os.stat(ent["path"]).st_mtime) / 86400.0
+                except OSError:
+                    ok = False
+                    dd = 0
+                if ok:
+                    if op == ">" and not dd > days:
+                        ok = False
+                    elif op == "<" and not dd < days:
+                        ok = False
             if mdate_spec is not None and ok:
                 op, tts = mdate_spec
-                try: fts = os.stat(ent["path"]).st_mtime
-                except Exception: fts = 0
-                if op == ">" and not fts > tts: ok = False
-                elif op == "<" and not fts < tts: ok = False
-                elif op == "=" and not int(fts/86400) == int(tts/86400): ok = False
-            if ok: selected_set.add(idx); hit += 1
+                try:
+                    fts = os.stat(ent["path"]).st_mtime
+                except OSError:
+                    ok = False
+                    fts = 0
+                if ok:
+                    if op == ">" and not fts > tts:
+                        ok = False
+                    elif op == "<" and not fts < tts:
+                        ok = False
+                    elif op == "=" and not int(fts / 86400) == int(tts / 86400):
+                        ok = False
+            if ok:
+                selected_set.add(idx)
+                hit += 1
         dirty = True
         return (hit, f"selected {hit} items")
 
     rescan_directory()
 
     while True:
-        # ========== 只有 dirty=True 才重绘屏幕，消除无意义刷屏 ==========
         if dirty:
-            stdscr.erase()   # ✅ 重点：erase()替代clear()，不发送终端清屏序列，大幅减少闪烁
+            stdscr.erase()
             h, w = stdscr.getmaxyx()
             btn_row = h - 1
 
@@ -350,127 +614,183 @@ def tui_main(stdscr):
             gap = 2
             for (bname, action) in btn_defs:
                 b_len = len(bname)
-                rendered_buttons.append({"name":bname, "action":action, "x1":bx, "x2":bx + b_len -1})
+                rendered_buttons.append({"name": bname, "action": action,
+                                         "x1": bx, "x2": bx + b_len - 1})
                 bx += b_len + gap
 
             if mode == MODE_LIST:
-                title = f"🔍 SEARCH | PWD: {current_pwd} | ENTER=confirm,ESC=cancel" if search_mode \
-                        else f"📂 FileShredder | /搜索 :命令 n=下匹配 N=上匹配"
-                stdscr.addstr(0, 0, title[:w-1], curses.A_BOLD)
-                stdscr.addstr(1, 0, "-" * min(w, len(title)))
+                title = (f"🔍 SEARCH | PWD: {current_pwd} | ENTER=confirm,ESC=cancel"
+                         if search_mode else
+                         "📂 FileShredder | /搜索 :命令 n=下匹配 N=上匹配")
+                put(0, 0, title, curses.A_BOLD)
+                put(1, 0, "-" * len(clip(title, w - 1)))
+
                 max_lines = btn_row - 4
-                if cursor_idx < view_offset: view_offset = cursor_idx
-                if cursor_idx >= view_offset + max_lines: view_offset = cursor_idx - max_lines + 1
+                if max_lines < 1:
+                    max_lines = 1
+                if cursor_idx < view_offset:
+                    view_offset = cursor_idx
+                if cursor_idx >= view_offset + max_lines:
+                    view_offset = cursor_idx - max_lines + 1
+                if view_offset < 0:
+                    view_offset = 0
+
                 for di in range(max_lines):
                     ri = view_offset + di
-                    if ri >= len(scan_entries): break
+                    if ri >= len(scan_entries):
+                        break
                     ent = scan_entries[ri]
-                    roi = original_scan_entries.index(ent)
-                    marker = "[✓]" if roi in selected_set else "[ ]"
-                    icon = "⬆️" if ent.get("is_parent_link") else ("📁" if ent["is_dir"] else "📄")
-                    txt = f"{marker} {icon} {ent['name']}"
-                    stdscr.addstr(2+di, 0, txt[:w-1], curses.A_REVERSE if ri == cursor_idx else curses.A_NORMAL)
+                    marker = "[✓]" if ri in selected_set else "[ ]"
+                    if ent.get("is_parent_link"):
+                        icon = "⬆️"
+                    elif ent["is_dir"]:
+                        icon = "📁"
+                    else:
+                        icon = "📄"
+                    attr = curses.A_REVERSE if ri == cursor_idx else curses.A_NORMAL
+                    put(2 + di, 0, f"{marker} {icon} {ent['name']}", attr)
+
                 sy = btn_row - 1
                 if search_mode:
-                    stdscr.addstr(sy, 0, f"/{search_keyword}"[:w-1], curses.A_REVERSE)
+                    put(sy, 0, f"/{search_keyword}", curses.A_REVERSE)
                 else:
-                    stdscr.addstr(sy, 0, f"↑↓滚动 | 点击勾选 | Sel:{len(selected_set)} | Matches:{len(search_matches)}"[:w-1])
+                    left = f"Sel:{len(selected_set)} | Matches:{len(search_matches)}"
+                    if status_msg:
+                        put(sy, 0, f"⚠ {status_msg}  |  {left}",
+                            curses.A_BOLD | curses.A_REVERSE)
+                    else:
+                        put(sy, 0, f"↑↓滚动 | 点击勾选 | {left}")
+
                 for rb in rendered_buttons:
-                    if rb["x1"] >= w: break
-                    stdscr.addstr(btn_row, rb["x1"], rb["name"], curses.A_BOLD | curses.A_REVERSE)
+                    if rb["x1"] >= w:
+                        break
+                    put(btn_row, rb["x1"], rb["name"], curses.A_BOLD | curses.A_REVERSE,
+                        maxcols=w - rb["x1"] - 1)
 
             elif mode == MODE_PREVIEW:
-                stdscr.addstr(0, 0, "📋 Preview selected items (Folders will RECURSIVELY shred)", curses.A_BOLD)
-                stdscr.addstr(1, 0, "="*(w-1)); y = 2
-                for ent in all_selected_entries:
-                    if ent.get("is_parent_link"): continue
+                put(0, 0, "📋 Preview selected items (Folders will RECURSIVELY shred)", curses.A_BOLD)
+                put(1, 0, "=" * (w - 1))
+                y = 2
+                missing_n = 0
+                for idx, ent in enumerate(all_selected_entries):
+                    if ent.get("is_parent_link"):
+                        continue
                     typ = "FOLDER(RECURSIVE)" if ent["is_dir"] else "FILE"
-                    if y >= btn_row - 1: break
-                    stdscr.addstr(y, 0, f"[{y-1}] {typ}: {ent['path']}"[:w-1]); y += 1
-                stdscr.addstr(btn_row-1, 0, "ENTER → Confirm | ESC Back")
-                stdscr.addstr(btn_row, 0, "[Quit]  [Back]"[:w-1], curses.A_BOLD | curses.A_REVERSE)
+                    try:
+                        exists = os.path.exists(ent["path"])
+                    except OSError:
+                        exists = False
+                    if not exists:
+                        missing_n += 1
+                    tag = "" if exists else "  [已不存在,将跳过]"
+                    if y >= btn_row - 1:
+                        break
+                    put(y, 0, f"[{idx + 1}] {typ}: {ent['path']}{tag}")
+                    y += 1
+                foot = "ENTER → Confirm | ESC Back"
+                if missing_n:
+                    foot = f"⚠ {missing_n} 项已不存在将被跳过 | " + foot
+                put(btn_row - 1, 0, foot)
+                put(btn_row, 0, "[Quit]  [Back]", curses.A_BOLD | curses.A_REVERSE)
 
             elif mode == MODE_CONFIRM1:
                 msg = "⚠️ FIRST CONFIRM: You are going to shred selected items!"
                 warn = "Folders will recursively overwrite ALL inner files!"
                 prompt = "Press ENTER to continue to SECOND confirmation, ESC cancel"
-                stdscr.addstr(h//2-2, max(0,w//2-len(msg)//2), msg, curses.A_BOLD|curses.A_REVERSE)
-                stdscr.addstr(h//2-1, max(0,w//2-len(warn)//2), warn)
-                stdscr.addstr(h//2, max(0,w//2-len(prompt)//2), prompt)
-                stdscr.addstr(btn_row, 0, "[Quit]  [Cancel]  [NextConfirm]"[:w-1], curses.A_BOLD|curses.A_REVERSE)
+                put(h // 2 - 2, max(0, w // 2 - len(msg) // 2), msg, curses.A_BOLD | curses.A_REVERSE)
+                put(h // 2 - 1, max(0, w // 2 - len(warn) // 2), warn)
+                put(h // 2, max(0, w // 2 - len(prompt) // 2), prompt)
+                put(btn_row, 0, "[Quit]  [Cancel]  [NextConfirm]", curses.A_BOLD | curses.A_REVERSE)
 
             elif mode == MODE_CONFIRM2:
                 msg = "🚨 FINAL CONFIRM: DATA CANNOT BE RESTORED AFTER SHREDDING!"
                 prompt = ">> ENTER START SHREDDING | ESC ABORT <<"
-                stdscr.addstr(h//2-1, max(0,w//2-len(msg)//2), msg, curses.A_BOLD|curses.A_REVERSE)
-                stdscr.addstr(h//2, max(0,w//2-len(prompt)//2), prompt)
-                stdscr.addstr(btn_row, 0, "[Quit]  [Abort]  [START SHRED]"[:w-1], curses.A_BOLD|curses.A_REVERSE)
+                put(h // 2 - 1, max(0, w // 2 - len(msg) // 2), msg, curses.A_BOLD | curses.A_REVERSE)
+                put(h // 2, max(0, w // 2 - len(prompt) // 2), prompt)
+                put(btn_row, 0, "[Quit]  [Abort]  [START SHRED]", curses.A_BOLD | curses.A_REVERSE)
 
             elif mode == MODE_SHREDDING:
-                split_x = w // 2
-                stdscr.addstr(0, 0, "📌 Processing Path", curses.A_BOLD)
-                stdscr.addstr(1, 0, "-"*(split_x-1)); left_h = btn_row-3
+                split_x = max(10, w // 2)
+                put(0, 0, "📌 Processing Path", curses.A_BOLD)
+                put(1, 0, "-" * (split_x - 1))
+                left_h = btn_row - 3
                 if current_global_idx < len(total_file_list):
                     cp = total_file_list[current_global_idx]
-                    stdscr.addstr(2, 0, f">>> {cp}"[:split_x-1], curses.A_REVERSE)
+                    put(2, 0, f">>> {cp}", curses.A_REVERSE, maxcols=split_x - 1)
                     hy = 3
-                    for hi in range(max(0, current_global_idx-(left_h-3)), current_global_idx):
-                        stdscr.addstr(hy, 0, f"✓ {total_file_list[hi]}"[:split_x-1]); hy += 1
-                        if hy >= left_h+2: break
-                stdscr.addstr(0, split_x, "✅ Shred Status", curses.A_BOLD)
-                stdscr.addstr(1, split_x, "-"*(w-split_x-1))
+                    for hi in range(max(0, current_global_idx - (left_h - 3)), current_global_idx):
+                        if hy >= left_h + 2:
+                            break
+                        put(hy, 0, f"✓ {total_file_list[hi]}", maxcols=split_x - 1)
+                        hy += 1
+                put(0, split_x, "✅ Shred Status", curses.A_BOLD)
+                put(1, split_x, "-" * max(0, w - split_x - 1))
                 gd, gt = current_global_idx, total_file_count
-                gp = int(gd/gt*100) if gt else 0
-                stdscr.addstr(2, split_x, f"Total: {gd}/{gt}  {gp}%")
-                bw = w-split_x-4; bf = int(bw*gp/100)
-                stdscr.addstr(3, split_x, f"[{'#'*bf}{'-'*(bw-bf)}]")
-                stdscr.addstr(5, split_x, f"Current File: {current_file_pct}%")
-                stdscr.addstr(6, split_x, f"Status: {current_file_status}")
+                gp = int(gd / gt * 100) if gt else 0
+                put(2, split_x, f"Total: {gd}/{gt}  {gp}%")
+                bw = max(1, w - split_x - 4)
+                bf = int(bw * gp / 100)
+                put(3, split_x, f"[{'#' * bf}{'-' * (bw - bf)}]")
+                put(5, split_x, f"Current File: {current_file_pct}%")
+                put(6, split_x, f"Status: {current_file_status}")
 
             elif mode == MODE_CMDLINE:
-                stdscr.addstr(0, 0, f"📂 Command mode | ESC cancel | cmd: {cmd_buffer}", curses.A_BOLD)
-                if cmd_error: stdscr.addstr(1, 0, f"⚠️ {cmd_error}", curses.A_REVERSE)
-                stdscr.addstr(btn_row, 0, f":{cmd_buffer}"[:w-1], curses.A_REVERSE)
+                put(0, 0, f"📂 Command mode | ESC cancel | cmd: {cmd_buffer}", curses.A_BOLD)
+                if cmd_error:
+                    put(1, 0, f"⚠️ {cmd_error}", curses.A_REVERSE)
+                put(btn_row, 0, f":{cmd_buffer}", curses.A_REVERSE)
 
             stdscr.refresh()
-            dirty = False  # ✅ 绘制完成，重置dirty标记
+            dirty = False
 
-        # ---- shred generator ：后台进度更新，自动置dirty ----
+        # ---- shred 生成器推进（无按键也继续跑）----
         if mode == MODE_SHREDDING:
             if current_global_idx >= total_file_count:
                 stdscr.erase()
-                stdscr.addstr(0, 0, "🎉 All shred tasks finished!", curses.A_BOLD)
-                stdscr.addstr(2, 0, f"Total shredded files: {total_file_count}")
-                stdscr.addstr(4, 0, "Press any key back to directory browser")
+                put(0, 0, "🎉 All shred tasks finished!", curses.A_BOLD)
+                put(2, 0, f"Total shredded files: {total_file_count}")
+                put(4, 0, "Press any key back to directory browser")
                 stdscr.refresh()
-                while key_reader.read_one() is None: time.sleep(0.03)
-                rescan_directory(); search_mode = False
-                search_keyword = ""; search_matches = []; mode = MODE_LIST
+                while key_reader.read_one() is None:
+                    time.sleep(0.03)
+                search_mode = False
+                search_keyword = ""
+                search_matches = []
+                mode = MODE_LIST
+                rescan_directory()
                 continue
             if current_file_generator is None:
-                current_file_generator = shred_single_file(total_file_list[current_global_idx], passes=SHRED_PASSES)
+                current_file_generator = shred_single_file(
+                    total_file_list[current_global_idx], passes=SHRED_PASSES)
             try:
                 current_file_pct, current_file_status = next(current_file_generator)
-                dirty = True # 进度变更 → 需要重绘
+                dirty = True
             except StopIteration:
-                current_global_idx += 1; current_file_generator = None
-                current_file_pct, current_file_status = 0, "Waiting next file"
+                current_global_idx += 1
+                current_file_generator = None
+                current_file_pct = 0
+                current_file_status = "Waiting next file"
                 dirty = True
 
         key = key_reader.read_one()
         if key is None:
-            time.sleep(0.03); continue
+            time.sleep(0.03)
+            continue
 
-        # ---- dispatch ----
+        # ---- 鼠标 / 触屏 ----
         if isinstance(key, tuple) and key[0] == "MOUSE":
             _, btn, mx, my, pressed = key
             mx -= 1
             my -= 1
 
             if btn == 64:
-                cursor_idx = max(0, cursor_idx-1); dirty = True; continue
+                cursor_idx = max(0, cursor_idx - 1)
+                _scroll_to(cursor_idx)
+                continue
             if btn == 65:
-                cursor_idx = min(len(scan_entries)-1, cursor_idx+1); dirty = True; continue
+                cursor_idx = min(len(scan_entries) - 1, cursor_idx + 1)
+                _scroll_to(cursor_idx)
+                continue
 
             if mode == MODE_LIST:
                 h, w = stdscr.getmaxyx()
@@ -480,131 +800,238 @@ def tui_main(stdscr):
                 gap = 2
                 for (bname, action) in btn_defs:
                     b_len = len(bname)
-                    rendered_buttons.append({"name":bname, "action":action, "x1":bx, "x2":bx + b_len -1})
+                    rendered_buttons.append({"name": bname, "action": action,
+                                             "x1": bx, "x2": bx + b_len - 1})
                     bx += b_len + gap
 
                 if my == btn_row:
                     for rb in rendered_buttons:
                         if rb["x1"] <= mx <= rb["x2"]:
                             action = rb["action"]
-                            if action == "quit": return
+                            if action == "quit":
+                                return
                             elif action == "sel_all":
                                 selected_set.clear()
                                 for i, e in enumerate(original_scan_entries):
-                                    if not e.get("is_parent_link"): selected_set.add(i)
-                            elif action == "clear_sel": selected_set.clear()
+                                    if not e.get("is_parent_link"):
+                                        selected_set.add(i)
+                                set_status(f"已全选 {len(selected_set)} 项")
+                            elif action == "clear_sel":
+                                selected_set.clear()
+                                set_status("已清空选择")
                             elif action == "confirm":
-                                if selected_set:
-                                    all_selected_entries = [original_scan_entries[i] for i in sorted(selected_set)
+                                if not selected_set:
+                                    set_status("未选中任何项，无法进入预览")
+                                else:
+                                    all_selected_entries = [
+                                        original_scan_entries[i] for i in sorted(selected_set)
                                         if not original_scan_entries[i].get("is_parent_link")]
                                     mode = MODE_PREVIEW
-                            dirty = True
+                                    dirty = True
                             break
                 elif not search_mode:
                     dl = my - 2
                     max_lines = btn_row - 4
+                    if max_lines < 1:
+                        max_lines = 1
                     if 0 <= dl < max_lines:
                         ci = view_offset + dl
-                        if ci < len(scan_entries):
+                        if 0 <= ci < len(scan_entries):
                             cursor_idx = ci
-                            ri = original_scan_entries.index(scan_entries[ci])
-                            if ri in selected_set:
-                                selected_set.discard(ri)
+                            if ci in selected_set:
+                                selected_set.discard(ci)
                             else:
-                                selected_set.add(ri)
+                                selected_set.add(ci)
                             dirty = True
             continue
 
+        # ---- 列表页键盘 ----
         if mode == MODE_LIST:
             if search_mode:
                 search_matches = compute_search_matches(search_keyword)
                 dirty = True
-                if key == "ESC": search_mode = False
+                if key == "ESC":
+                    search_mode = False
                 elif key == "ENTER":
                     search_mode = False
-                    if search_matches: current_match_idx = 0; goto_next_match()
-                elif key == "BACKSPACE": search_keyword = search_keyword[:-1]
-                else: search_keyword += key
+                    if search_matches:
+                        current_match_idx = 0
+                        goto_next_match()
+                elif key == "BACKSPACE":
+                    search_keyword = search_keyword[:-1]
+                else:
+                    search_keyword += key
                 continue
 
-            if key == '/': search_mode = True; dirty = True
-            elif key == "UP": cursor_idx = max(0, cursor_idx-1); dirty = True
-            elif key == "DOWN": cursor_idx = min(len(scan_entries)-1, cursor_idx+1); dirty = True
+            if key == '/':
+                search_mode = True
+                dirty = True
+            elif key == "UP":
+                cursor_idx = max(0, cursor_idx - 1)
+                _scroll_to(cursor_idx)
+            elif key == "DOWN":
+                cursor_idx = min(len(scan_entries) - 1, cursor_idx + 1)
+                _scroll_to(cursor_idx)
             elif key == ' ':
                 if scan_entries:
-                    roi = original_scan_entries.index(scan_entries[cursor_idx])
-                    selected_set.discard(roi) if roi in selected_set else selected_set.add(roi)
+                    if cursor_idx in selected_set:
+                        selected_set.discard(cursor_idx)
+                    else:
+                        selected_set.add(cursor_idx)
                     dirty = True
             elif key == "ENTER":
-                if not scan_entries: continue
+                if not scan_entries:
+                    continue
                 ce = scan_entries[cursor_idx]
-                if ce.get("is_parent_link"):
-                    old_pwd, current_pwd = current_pwd, ce["path"]; rescan_directory()
-                elif ce["is_dir"]:
-                    old_pwd, current_pwd = current_pwd, ce["path"]; rescan_directory()
+                if ce.get("is_parent_link") or ce["is_dir"]:
+                    # 镂空检测后再进入
+                    safe_enter_dir(ce["path"])
                 else:
+                    p = ce["path"]
+                    if not os.path.isfile(p):
+                        set_status(f"文件不存在或已被删除: {p}")
+                        continue
                     if not selected_set:
-                        selected_set.add(original_scan_entries.index(ce))
-                    all_selected_entries = [original_scan_entries[i] for i in sorted(selected_set)
+                        selected_set.add(cursor_idx)
+                    all_selected_entries = [
+                        original_scan_entries[i] for i in sorted(selected_set)
                         if not original_scan_entries[i].get("is_parent_link", False)]
+                    if not all_selected_entries:
+                        set_status("没有可处理的选中项")
+                        continue
                     mode = MODE_PREVIEW
                     dirty = True
-            elif key == 'q': return
-            elif key == ':': mode = MODE_CMDLINE; cmd_buffer = ""; cmd_error = ""; dirty = True
-            elif key == 'n': goto_next_match()
-            elif key == 'N': goto_prev_match()
+            elif key == 'q':
+                return
+            elif key == ':':
+                mode = MODE_CMDLINE
+                cmd_buffer = ""
+                cmd_error = ""
+                dirty = True
+            elif key == 'n':
+                goto_next_match()
+            elif key == 'N':
+                goto_prev_match()
 
+        # ---- 命令行 ----
         elif mode == MODE_CMDLINE:
-            if key == "ESC": mode = MODE_LIST; cmd_buffer = ""; cmd_error = ""; dirty = True
+            if key == "ESC":
+                mode = MODE_LIST
+                cmd_buffer = ""
+                cmd_error = ""
+                dirty = True
             elif key == "ENTER":
-                parts = cmd_buffer.strip().split(maxsplit=1); cmd_error = ""
-                if not parts: mode = MODE_LIST; dirty = True; continue
-                cmd, rest = parts[0], parts[1] if len(parts) >= 2 else ""
+                parts = cmd_buffer.strip().split(maxsplit=1)
+                cmd_error = ""
+                if not parts:
+                    mode = MODE_LIST
+                    dirty = True
+                    continue
+                cmd = parts[0]
+                rest = parts[1] if len(parts) >= 2 else ""
                 if cmd == "cd":
                     arg = rest.strip()
-                    try:
-                        target = old_pwd if arg == "-" else os.path.abspath(os.path.join(current_pwd, arg))
-                        if os.path.isdir(target):
-                            old_pwd, current_pwd = current_pwd, target; rescan_directory()
-                        else: cmd_error = f"no such directory: {target}"
-                    except Exception as e: cmd_error = str(e)
+                    if not arg:
+                        cmd_error = "cd 需要路径参数，例如 :cd /sdcard"
+                    elif arg == "-":
+                        if os.path.isdir(old_pwd):
+                            tmp = current_pwd
+                            current_pwd = old_pwd
+                            old_pwd = tmp
+                            status_msg = ""
+                            rescan_directory()
+                        else:
+                            cmd_error = f"上一路径已不存在: {old_pwd}"
+                    else:
+                        target = os.path.abspath(os.path.join(current_pwd, arg))
+                        if not os.path.exists(target):
+                            cmd_error = f"路径不存在: {target}"
+                        elif not os.path.isdir(target):
+                            cmd_error = f"目标不是文件夹: {target}"
+                        else:
+                            try:
+                                os.listdir(target)
+                            except PermissionError:
+                                cmd_error = f"无权限访问: {target}"
+                            except OSError as e:
+                                cmd_error = f"无法访问: {target}（{getattr(e, 'strerror', None) or e}）"
+                            else:
+                                old_pwd = current_pwd
+                                current_pwd = target
+                                status_msg = ""
+                                rescan_directory()
                 elif cmd == "select":
                     arg = rest.strip()
                     if arg == "":
-                        ent = original_scan_entries[cursor_idx]
-                        if not ent.get("is_parent_link"):
-                            selected_set.discard(cursor_idx) if cursor_idx in selected_set else selected_set.add(cursor_idx)
-                            dirty = True
-                    elif arg == "!": select_invert()
-                    elif arg == "clear": selected_set.clear(); dirty = True
+                        if scan_entries and 0 <= cursor_idx < len(scan_entries):
+                            ent = scan_entries[cursor_idx]
+                            if not ent.get("is_parent_link"):
+                                if cursor_idx in selected_set:
+                                    selected_set.discard(cursor_idx)
+                                else:
+                                    selected_set.add(cursor_idx)
+                                dirty = True
+                    elif arg == "!":
+                        select_invert()
+                    elif arg == "clear":
+                        selected_set.clear()
+                        dirty = True
+                        set_status("已清空选择")
                     else:
-                        _, cmd_error = select_multi_condition(arg)
+                        hit, msg = select_multi_condition(arg)
+                        cmd_error = "" if hit > 0 else "没有条目符合条件"
+                        set_status(msg if hit > 0 else "0 项匹配")
                 else:
-                    cmd_error = f"unknown cmd: {cmd}, support: cd, select"
-                if not cmd_error: mode = MODE_LIST
+                    cmd_error = f"unknown cmd: {cmd}，支持 cd / select"
+                if not cmd_error:
+                    mode = MODE_LIST
                 dirty = True
-            elif key == "BACKSPACE": cmd_buffer = cmd_buffer[:-1]; dirty = True
-            else: cmd_buffer += key; dirty = True
 
+        # ---- 预览 / 双重确认 ----
         elif mode == MODE_PREVIEW:
-            if key == "ENTER": mode = MODE_CONFIRM1; dirty = True
-            elif key == "ESC": mode = MODE_LIST; dirty = True
+            if key == "ENTER":
+                mode = MODE_CONFIRM1
+                dirty = True
+            elif key == "ESC":
+                mode = MODE_LIST
+                dirty = True
+
         elif mode == MODE_CONFIRM1:
-            if key == "ENTER": mode = MODE_CONFIRM2; dirty = True
-            elif key == "ESC": mode = MODE_LIST; dirty = True
+            if key == "ENTER":
+                mode = MODE_CONFIRM2
+                dirty = True
+            elif key == "ESC":
+                mode = MODE_LIST
+                dirty = True
+
         elif mode == MODE_CONFIRM2:
             if key == "ENTER":
                 total_file_list.clear()
+                missing = 0
                 for ent in all_selected_entries:
+                    if not os.path.exists(ent["path"]):
+                        missing += 1
+                        continue
                     total_file_list.extend(collect_all_files(ent["path"]))
-                total_file_count = len(total_file_list); current_global_idx = 0
-                mode = MODE_SHREDDING
+                total_file_count = len(total_file_list)
+                current_global_idx = 0
+                current_file_generator = None
+                current_file_pct = 0
+                if total_file_count == 0:
+                    mode = MODE_LIST
+                    set_status(f"选中项已不存在或为空（缺失 {missing} 项），无文件可粉碎")
+                else:
+                    mode = MODE_SHREDDING
+                    dirty = True
+            elif key == "ESC":
+                mode = MODE_LIST
                 dirty = True
-            elif key == "ESC": mode = MODE_LIST; dirty = True
+
 
 if __name__ == "__main__":
     USE_SYSTEM_SHRED = True
     if not os.path.exists("/storage/emulated/0"):
-        print("[!] Run `termux-setup-storage` first"); sys.exit(1)
-    print("===== ✅ No Flash Version (erase() + dirty flag) =====")
+        print("[!] 先执行 termux-setup-storage 授权存储")
+        sys.exit(1)
+    print("===== 镂空检测版：路径不存在只提示，不崩溃 =====")
     curses.wrapper(tui_main)
