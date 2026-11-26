@@ -180,6 +180,59 @@ def clip(text, maxcols):
     return "".join(out)
 
 
+# ============ Shredder shell history（家目录持久化 + 内存）============
+HISTORY_FILE = os.path.join(os.path.expanduser("~"), ".fileshredder_history")
+HISTORY_MAX = 200
+
+
+def load_history():
+    """读取家目录历史文件；不存在/无权限/是目录时返回空列表，绝不抛异常"""
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.read().splitlines()
+    except (FileNotFoundError, IsADirectoryError):
+        return []
+    except OSError:
+        return []
+    out = []
+    for raw in lines:
+        cmd = raw.strip()
+        if cmd and (not out or out[-1] != cmd):
+            out.append(cmd)
+    return out[-HISTORY_MAX:]
+
+
+def save_history(entries):
+    """原子写入家目录历史文件（先写 .tmp 再 replace），失败只返回 False"""
+    try:
+        tmp = HISTORY_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            for e in entries[-HISTORY_MAX:]:
+                f.write(e.replace("\r", " ").replace("\n", " ") + "\n")
+        os.replace(tmp, HISTORY_FILE)
+        try:
+            os.chmod(HISTORY_FILE, 0o600)
+        except OSError:
+            pass
+        return True
+    except OSError:
+        return False
+
+
+def append_history(entries, cmd):
+    """追加一条命令：空命令跳过、连续重复跳过、超上限裁剪，并立即落盘"""
+    cmd = (cmd or "").strip()
+    if not cmd:
+        return entries
+    if entries and entries[-1] == cmd:
+        return entries
+    entries.append(cmd)
+    if len(entries) > HISTORY_MAX:
+        del entries[:-HISTORY_MAX]
+    save_history(entries)
+    return entries
+
+
 # ============ RAW stdin reader: UTF-8 chars + ANSI keys + mouse reports ============
 class RawKeyReader:
     def __init__(self):
@@ -295,6 +348,11 @@ def tui_main(stdscr):
 
     status_msg = ""
     dirty = True
+
+    # ===== Shredder shell history：家目录文件 + 内存合流 =====
+    hist_list = load_history()
+    cmd_hist_idx = len(hist_list)   # == len(hist_list) 表示正在编辑新命令
+    cmd_draft = ""                  # 进入历史浏览前暂存的草稿
 
     btn_defs = [
         ("[Quit]", "quit"),
@@ -735,10 +793,31 @@ def tui_main(stdscr):
                 put(6, split_x, f"Status: {current_file_status}")
 
             elif mode == MODE_CMDLINE:
-                put(0, 0, f"📂 Command mode | ESC cancel | cmd: {cmd_buffer}", curses.A_BOLD)
+                hint = f"↑↓ 历史({len(hist_list)})"
+                if hist_list and cmd_hist_idx < len(hist_list):
+                    hint += f" [{cmd_hist_idx + 1}/{len(hist_list)}]"
+                put(0, 0, f"📂 Command mode | ESC cancel | {hint} | cmd: {cmd_buffer}", curses.A_BOLD)
                 if cmd_error:
                     put(1, 0, f"⚠️ {cmd_error}", curses.A_REVERSE)
+
+                # 历史浏览：显示当前光标附近若干条，当前项高亮
+                y = 3 if cmd_error else 2
+                max_lines = btn_row - y - 1
+                if hist_list and max_lines > 0:
+                    start = max(0, cmd_hist_idx - 3)
+                    end = min(len(hist_list), start + max_lines)
+                    if end - start < max_lines:
+                        start = max(0, end - max_lines)
+                    for hi in range(start, end):
+                        if y >= btn_row - 1:
+                            break
+                        prefix = ">" if hi == cmd_hist_idx else " "
+                        attr = curses.A_REVERSE if hi == cmd_hist_idx else curses.A_NORMAL
+                        put(y, 0, f"{prefix} {hi + 1}: {hist_list[hi]}", attr)
+                        y += 1
+
                 put(btn_row, 0, f":{cmd_buffer}", curses.A_REVERSE)
+                put(btn_row - 1, 0, f"history file: {HISTORY_FILE}")
 
             stdscr.refresh()
             dirty = False
@@ -907,21 +986,45 @@ def tui_main(stdscr):
                 mode = MODE_CMDLINE
                 cmd_buffer = ""
                 cmd_error = ""
+                cmd_hist_idx = len(hist_list)
+                cmd_draft = ""
                 dirty = True
             elif key == 'n':
                 goto_next_match()
             elif key == 'N':
                 goto_prev_match()
 
-        # ---- 命令行 ----
+        # ---- 命令行（含 shell history ↑↓ 调取：内存 + 家目录文件合并）----
         elif mode == MODE_CMDLINE:
             if key == "ESC":
                 mode = MODE_LIST
                 cmd_buffer = ""
                 cmd_error = ""
+                cmd_hist_idx = len(hist_list)
+                cmd_draft = ""
                 dirty = True
+            elif key == "UP":
+                # 上翻历史：第一次离开当前输入时先暂存草稿
+                if hist_list:
+                    if cmd_hist_idx >= len(hist_list):
+                        cmd_draft = cmd_buffer
+                    if cmd_hist_idx > 0:
+                        cmd_hist_idx -= 1
+                        cmd_buffer = hist_list[cmd_hist_idx]
+                    dirty = True
+            elif key == "DOWN":
+                # 下翻历史：越过末尾回到草稿
+                if hist_list:
+                    if cmd_hist_idx < len(hist_list) - 1:
+                        cmd_hist_idx += 1
+                        cmd_buffer = hist_list[cmd_hist_idx]
+                    elif cmd_hist_idx >= len(hist_list) - 1:
+                        cmd_hist_idx = len(hist_list)
+                        cmd_buffer = cmd_draft
+                    dirty = True
             elif key == "ENTER":
-                parts = cmd_buffer.strip().split(maxsplit=1)
+                raw_cmd = cmd_buffer.strip()
+                parts = raw_cmd.split(maxsplit=1)
                 cmd_error = ""
                 if not parts:
                     mode = MODE_LIST
@@ -981,11 +1084,42 @@ def tui_main(stdscr):
                         hit, msg = select_multi_condition(arg)
                         cmd_error = "" if hit > 0 else "没有条目符合条件"
                         set_status(msg if hit > 0 else "0 项匹配")
+                elif cmd == "history":
+                    if not hist_list:
+                        set_status(f"历史为空（文件 {HISTORY_FILE}）")
+                    else:
+                        set_status(f"历史 {len(hist_list)} 条 → 文件 {HISTORY_FILE}")
+                elif cmd == "history-clear":
+                    hist_list = []
+                    save_history(hist_list)
+                    set_status(f"历史已清空（{HISTORY_FILE}）")
                 else:
-                    cmd_error = f"unknown cmd: {cmd}，支持 cd / select"
+                    cmd_error = f"unknown cmd: {cmd}，支持 cd / select / history"
+
+                # 成功失败都记入历史（方便直接 ↑ 重试）
+                hist_list = append_history(hist_list, raw_cmd)
+                cmd_hist_idx = len(hist_list)
+                cmd_draft = ""
                 if not cmd_error:
                     mode = MODE_LIST
                 dirty = True
+            elif key == "BACKSPACE":
+                if cmd_hist_idx < len(hist_list):
+                    # 从历史项继续编辑 → 视为新命令，不污染原条目
+                    cmd_hist_idx = len(hist_list)
+                    cmd_draft = cmd_buffer
+                cmd_buffer = cmd_buffer[:-1]
+                dirty = True
+            else:
+                if isinstance(key, str) and len(key) > 1:
+                    # LEFT / RIGHT 等多字符序列忽略，避免拼进命令
+                    pass
+                else:
+                    if cmd_hist_idx < len(hist_list):
+                        cmd_hist_idx = len(hist_list)
+                        cmd_draft = cmd_buffer
+                    cmd_buffer += key
+                    dirty = True
 
         # ---- 预览 / 双重确认 ----
         elif mode == MODE_PREVIEW:
@@ -1034,4 +1168,5 @@ if __name__ == "__main__":
         print("[!] 先执行 termux-setup-storage 授权存储")
         sys.exit(1)
     print("===== 镂空检测版：路径不存在只提示，不崩溃 =====")
+    print(f"[*] shell history 文件: {HISTORY_FILE}   (: 进入命令行后 ↑↓ 调取)")
     curses.wrapper(tui_main)
