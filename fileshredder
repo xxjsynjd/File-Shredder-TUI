@@ -3,12 +3,15 @@
 # ✅ 镂空检测：目录/文件不存在时不再抛异常退出，状态栏提示 + 自动回退最近可用父目录
 # ✅ 保留：中文输入 / Termux 触屏点击与滚动 / 动态底部按钮 / erase+dirty 防闪烁 / :select 多条件
 import curses
+import fnmatch
+import json
 import os
 import secrets
 import sys
 import subprocess
 import re
 import shlex
+import shutil
 import time
 import unicodedata
 from datetime import datetime
@@ -20,6 +23,68 @@ PAT_SIZE_OLD = re.compile(r"([+-]?\d+)([KMG])")
 PAT_MTIME_OLD = re.compile(r"([+-]?\d+)")
 PAT_SIZE_INTERVAL = re.compile(r"\[(.*?),(.*?)\]")
 PAT_MDATE = re.compile(r"([<>]?=?)(\d{4}-\d{2}-\d{2})")
+
+VERSION = "v13.3"
+
+# 标签页色彩标记：0=默认（不染色），1..6 用 curses color pair 41..46
+TAB_COLOR_NAMES = ("默认", "绿", "黄", "蓝", "紫", "红", "青")
+TAB_COLOR_PAIRS = (0, 41, 42, 43, 44, 45, 46)
+
+# 菜单栏：标题 / (显示文本, 快捷键提示, 动作名)
+MENUS = [
+    ("File", [
+        ("新建标签页", "^T", "new_tab"),
+        ("在当前目录开新标签", "", "dup_tab"),
+        ("打开路径…", ":cd", "open_path"),
+        ("复制选中", "^C", "copy"),
+        ("剪切选中", "^X", "cut"),
+        ("粘贴到当前目录", "^V", "paste"),
+        ("粉碎选中", "BS", "shred"),
+        ("属性 / 重命名", "ALT+ENTER", "props"),
+        ("文件夹属性", "", "dirprops"),
+        ("文件夹显示选项…", "", "folderopts"),
+        ("退出", "q", "quit"),
+    ]),
+    ("Edit", [
+        ("全选", "A", "select_all"),
+        ("取消全选", "", "clear_sel"),
+        ("反选", "", "invert_sel"),
+        ("复制", "^C", "copy"),
+        ("剪切", "^X", "cut"),
+        ("粘贴", "^V", "paste"),
+        ("清空剪贴板", "", "clear_clip"),
+        ("递归搜索…", "^F", "find"),
+        ("打开方式…（列出可用程序）", "ALT+R", "openwith"),
+    ]),
+    ("View", [
+        ("文件夹显示选项…", "", "folderopts"),
+        ("显示隐藏的文件 开/关", "", "toggle_hidden"),
+        ("隐藏已知扩展名 开/关", "", "toggle_ext"),
+        ("文件夹优先排序 开/关", "", "toggle_dirsfirst"),
+        ("切换排序方式", "S", "cycle_sort"),
+        ("刷新列表", "R", "refresh"),
+        ("返回上一级目录", "ALT+←", "up_dir"),
+        ("历史后退", "ALT+BS", "back"),
+        ("历史前进", "ALT+→", "fwd"),
+        ("递归搜索…", "^F", "find"),
+        ("属性面板", "ALT+ENTER", "props"),
+    ]),
+    ("Window", [
+        ("新建标签页", "^T", "new_tab"),
+        ("关闭当前标签页", "^W", "close_tab"),
+        ("下一个标签页", "", "next_tab"),
+        ("上一个标签页", "", "prev_tab"),
+        ("重命名当前标签页…", "ALT+T", "tab_rename"),
+        ("标签颜色（循环）", "ALT+C", "tab_color"),
+        ("标签页列表…", "", "tab_list"),
+    ]),
+    ("Help", [
+        ("键位帮助", "?", "help"),
+        ("关于", ":about", "about"),
+        ("偏好设置", ":about:preferences", "prefs"),
+        ("版本", "", "version"),
+    ]),
+]
 
 
 def shred_single_file_python(file_path, passes=2, chunk_size=1024 * 1024):
@@ -166,6 +231,40 @@ def parse_mtime_spec(spec):
     return (op, num)
 
 
+def text_width(text):
+    """字符串显示宽度（中日韩全角算 2 列）"""
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in str(text))
+
+
+def input_cursor(buf, cur):
+    """规范化光标位置"""
+    return max(0, min(cur, len(buf)))
+
+
+def edit_buffer(buf, cur, key):
+    """行编辑内核：返回 (buf, cur, handled)。
+    handled=False 表示这个键不是编辑键，交给调用方（ENTER/UP/DOWN/ESC 等）。"""
+    if key == "LEFT":
+        return buf, max(0, cur - 1), True
+    if key == "RIGHT":
+        return buf, min(len(buf), cur + 1), True
+    if key == "HOME":
+        return buf, 0, True
+    if key == "END":
+        return buf, len(buf), True
+    if key == "BACKSPACE":
+        if cur <= 0:
+            return buf, 0, True
+        return buf[:cur - 1] + buf[cur:], cur - 1, True
+    if key == "DELETE":
+        return buf[:cur] + buf[cur + 1:], cur, True
+    if key == "INS":
+        return buf, cur, True
+    if isinstance(key, str) and len(key) == 1 and ord(key) >= 32:
+        return buf[:cur] + key + buf[cur:], cur + 1, True
+    return buf, cur, False
+
+
 def clip(text, maxcols):
     """按显示宽度裁剪，中文占 2 列，避免 addstr 越界报 ERR"""
     if maxcols <= 0:
@@ -233,6 +332,702 @@ def append_history(entries, cmd):
     return entries
 
 
+# ============ Preferences（~/.fileshredder.json 持久化）============
+PREFS_FILE = os.path.join(os.path.expanduser("~"), ".fileshredder.json")
+DEFAULT_START_DIR = "/storage/emulated/0/Download/shred_test"
+DEFAULT_PREFS = {
+    "passes": 2,
+    "use_system_shred": True,
+    "default_dir": DEFAULT_START_DIR,
+    # 启动目录策略：default / argv / cwd / last
+    "start_mode": "last",
+    "last_dir": "",
+    # 文件夹显示选项
+    "show_hidden": False,     # 显示隐藏的文件、文件夹或驱动器（. 开头）
+    "hide_ext": False,        # 隐藏已知文件类型的扩展名（只影响显示，不影响粉碎/改名）
+    "dirs_first": True,       # 目录排在文件前面
+    "sort_key": "name",       # name / size / mtime / type
+    "sort_reverse": False,    # 反向排序
+    "show_size": False,       # 列表里显示大小列
+    "show_mtime": False,      # 列表里显示修改时间列
+    "show_perm": False,       # 列表里显示权限列
+}
+
+START_MODES = ("default", "argv", "cwd", "last")
+SORT_KEYS = ("name", "size", "mtime", "type")
+SORT_LABELS = {"name": "名称", "size": "大小", "mtime": "修改日期", "type": "类型"}
+
+START_MODE_LABELS = {
+    "default": "默认路径",
+    "argv": "命令行指定",
+    "cwd": "当前目录",
+    "last": "上次运行目录",
+}
+
+
+def load_prefs():
+    """读取偏好设置；文件缺失/损坏/类型不对时一律回落默认值，绝不抛异常"""
+    data = dict(DEFAULT_PREFS)
+    try:
+        with open(PREFS_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (FileNotFoundError, IsADirectoryError, ValueError, OSError):
+        return data
+    if not isinstance(raw, dict):
+        return data
+    try:
+        if isinstance(raw.get("passes"), int):
+            data["passes"] = max(1, min(9, int(raw["passes"])))
+    except (TypeError, ValueError):
+        pass
+    if isinstance(raw.get("use_system_shred"), bool):
+        data["use_system_shred"] = raw["use_system_shred"]
+    dd = raw.get("default_dir")
+    if isinstance(dd, str) and dd.strip():
+        data["default_dir"] = dd.strip()
+    sm = raw.get("start_mode")
+    if isinstance(sm, str) and sm.strip().lower() in START_MODES:
+        data["start_mode"] = sm.strip().lower()
+    ld = raw.get("last_dir")
+    if isinstance(ld, str) and ld.strip():
+        data["last_dir"] = ld.strip()
+    for flag in ("show_hidden", "hide_ext", "dirs_first", "sort_reverse",
+                 "show_size", "show_mtime", "show_perm"):
+        if isinstance(raw.get(flag), bool):
+            data[flag] = raw[flag]
+    sk = raw.get("sort_key")
+    if isinstance(sk, str) and sk.lower() in SORT_KEYS:
+        data["sort_key"] = sk.lower()
+    return data
+
+
+def save_prefs():
+    """原子写入偏好文件（.tmp + replace），权限 600"""
+    try:
+        tmp = PREFS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(PREFS, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, PREFS_FILE)
+        try:
+            os.chmod(PREFS_FILE, 0o600)
+        except OSError:
+            pass
+        return True
+    except OSError:
+        return False
+
+
+PREFS = load_prefs()
+
+# about:config 里能改的键（顺序即显示顺序）
+CONFIG_KEYS = [
+    ("passes",           "int",  "1-9，覆写遍数（越大越慢）"),
+    ("use_system_shred", "bool", "true=系统 shred / false=内置 python"),
+    ("default_dir",      "path", "默认起始目录（仅 default 策略使用）"),
+    ("start_mode",       "enum", "default | argv | cwd | last"),
+    ("last_dir",         "path", "上次运行目录（last 策略使用）"),
+]
+
+_CFG_BOOL_TRUE = {"true", "1", "yes", "on", "system", "sys", "shred"}
+_CFG_BOOL_FALSE = {"false", "0", "no", "off", "python", "py", "builtin", "internal"}
+
+
+def config_value_to_text(key, kind):
+    """把当前值转成可编辑的文本（bool 用 true/false）"""
+    v = PREFS.get(key)
+    if kind == "bool":
+        return "true" if bool(v) else "false"
+    if v is None:
+        return ""
+    return str(v)
+
+
+def parse_config_value(key, kind, raw):
+    """校验并转换输入的文本 -> (ok, value 或 error message)
+
+    · int  : 必须是 1-9 的整数
+    · bool : true/false/1/0/yes/no/on/off/system/python 等
+    · enum : 必须落在 START_MODES 里
+    · path : 展开 ~ 后转绝对路径；default_dir 要求目录存在
+    """
+    raw = (raw or "").strip()
+    if kind == "int":
+        try:
+            n = int(raw)
+        except ValueError:
+            return False, f"{key} 需要整数 1-9"
+        if not 1 <= n <= 9:
+            return False, f"{key} 必须在 1-9 之间"
+        return True, n
+    if kind == "bool":
+        low = raw.lower()
+        if low in _CFG_BOOL_TRUE:
+            return True, True
+        if low in _CFG_BOOL_FALSE:
+            return True, False
+        return False, f"{key} 需要 true/false（也接受 1/0、system/python）"
+    if kind == "enum":
+        low = raw.lower()
+        if low in START_MODES:
+            return True, low
+        return False, f"{key} 只能是 " + " / ".join(START_MODES)
+    # path
+    if not raw:
+        if key == "last_dir":
+            return True, ""          # 允许清空（等于“未记录”）
+        return False, f"{key} 不能为空"
+    pth = os.path.abspath(os.path.expanduser(raw))
+    if key == "default_dir" and not os.path.isdir(pth):
+        return False, f"默认目录不存在或不是文件夹: {pth}"
+    return True, pth
+
+
+# ============ 启动路径（命令行参数入口）============
+START_DIR = None       # 命令行传入的起始目录；None = 用默认 Downloads/shred_test
+START_FILE = None      # 传入的是单个文件时：进入其所在目录并预勾选该文件
+
+
+def search_hist_all(hist, query):
+    """返回所有包含 query 的历史下标，新的在前"""
+    q = (query or "").lower()
+    return [i for i in range(len(hist) - 1, -1, -1) if q in hist[i].lower()]
+
+
+def rev_search_hist(hist, query, start):
+    """在历史里从 start 往前找包含 query 的项，返回下标或 None"""
+    q = (query or "").lower()
+    i = min(start, len(hist) - 1)
+    while i >= 0:
+        if q in hist[i].lower():
+            return i
+        i -= 1
+    return None
+
+
+def complete_path(arg, base_cwd):
+    """Tab 路径补全 -> (新参数字符串或 None, [(显示文本, 完整参数)], 提示)
+
+    支持相对路径 / 绝对路径 / ~ 开头；唯一命中且是目录时自动补 / 结尾。
+    多命中时通过第 2 项返回全部候选，供菜单选择。
+    """
+    raw = arg or ""
+    dirpart, prefix = os.path.split(raw)
+    if os.path.isabs(os.path.expanduser(raw)):
+        searchdir = os.path.expanduser(dirpart) or "/"
+    else:
+        searchdir = os.path.abspath(os.path.join(base_cwd, os.path.expanduser(dirpart))) \
+            if dirpart else base_cwd
+    try:
+        names = os.listdir(searchdir)
+    except OSError as e:
+        return None, [], f"无法列目录 {searchdir}（{getattr(e, 'strerror', None) or e}）"
+
+    if not prefix:
+        cands = [n for n in names if not n.startswith(".")]
+    else:
+        cands = [n for n in names if n.startswith(prefix)]
+    cands.sort(key=lambda x: x.lower())
+    if not cands:
+        return None, [], f"无匹配: {raw}"
+
+    base = dirpart + "/" if dirpart else ""
+    items = []
+    for n in cands:
+        isdir = os.path.isdir(os.path.join(searchdir, n))
+        tail = "/" if isdir else ""
+        items.append((n + tail, base + n + tail))
+
+    if len(items) == 1:
+        return items[0][1], items, f"补全 → {items[0][1]}"
+    common = os.path.commonprefix(cands)
+    newarg = base + common if len(common) > len(prefix) else None
+    return newarg, items, f"{len(items)} 项候选"
+
+
+def compute_pick_geo(title, items, sel, h, w):
+    """菜单框布局 -> (top, left, boxw, shown, off)；渲染与点击命中共用"""
+    labels = [it[0] for it in items] or [""]
+    boxw = max(max(text_width(l) for l in labels),
+               text_width(title) + 9,      # 给 "  共N项" 留位置
+               16) + 6
+    boxw = max(min(boxw, w - 2), 20)
+    shown = min(len(items), max(3, h - 9))
+    top = max(2, (h - (shown + 5)) // 2)
+    left = max(0, (w - boxw) // 2)
+    off = 0
+    if sel >= shown:
+        off = sel - shown + 1
+    if sel < off:
+        off = sel
+    return top, left, boxw, shown, off
+
+
+# ============ 文件管理器操作：复制 / 移动 / 搜索 / 属性 ============
+FIND_LIMIT = 800
+
+
+def human_size(num):
+    """字节数 -> 人类可读（1024 进制）"""
+    try:
+        n = float(num)
+    except (TypeError, ValueError):
+        return "?"
+    if n < 0:
+        return "?"
+    if n < 1024:
+        return f"{int(n)} B"
+    for unit in ("KB", "MB", "GB", "TB", "PB"):
+        n /= 1024.0
+        if n < 1024 or unit == "PB":
+            return f"{n:.1f} {unit}"
+    return f"{n:.1f} PB"
+
+
+def unique_target(dirpath, name):
+    """dest 里同名冲突时生成 “名字 (1).ext”，返回可用路径或 None"""
+    target = os.path.join(dirpath, name)
+    if not os.path.lexists(target):
+        return target
+    stem, ext = os.path.splitext(name)
+    for i in range(1, 1000):
+        cand = os.path.join(dirpath, f"{stem} ({i}){ext}")
+        if not os.path.lexists(cand):
+            return cand
+    return None
+
+
+def copy_path(src, dest_dir):
+    """把单个文件/目录复制进 dest_dir，返回 (目标路径, 错误文本)"""
+    name = os.path.basename(src.rstrip("/")) or "item"
+    target = unique_target(dest_dir, name)
+    if target is None:
+        return None, f"{name}: 同名副本过多"
+    try:
+        if os.path.islink(src):
+            os.symlink(os.readlink(src), target)
+        elif os.path.isdir(src):
+            shutil.copytree(src, target, symlinks=True)
+        else:
+            shutil.copy2(src, target)
+    except PermissionError:
+        return None, f"{name}: 无权限"
+    except shutil.Error as e:
+        return None, f"{name}: 部分文件复制失败（{len(e.args[0]) if e.args else 0} 项）"
+    except OSError as e:
+        return None, f"{name}: {getattr(e, 'strerror', None) or e}"
+    return target, ""
+
+
+def move_path(src, dest_dir):
+    """把单个文件/目录移动到 dest_dir，返回 (目标路径, 错误文本)"""
+    name = os.path.basename(src.rstrip("/")) or "item"
+    target = unique_target(dest_dir, name)
+    if target is None:
+        return None, f"{name}: 同名副本过多"
+    try:
+        shutil.move(src, target)
+    except PermissionError:
+        return None, f"{name}: 无权限"
+    except shutil.Error as e:
+        return None, f"{name}: 移动失败（跨设备/权限）"
+    except OSError as e:
+        return None, f"{name}: {getattr(e, 'strerror', None) or e}"
+    return target, ""
+
+
+FIND_SCOPES = ("名称", "名称+路径", "文件内容")
+FIND_CONTENT_MAXSIZE = 2 * 1024 * 1024   # 内容搜索只读 <= 2MB 的文件
+FIND_CONTENT_MAXFILES = 2000             # 内容搜索最多读这么多个文件
+
+
+def folder_find(root, query, limit=FIND_LIMIT, scope="名称", include_hidden=True):
+    """在当前文件夹内全方位搜索 -> (hits, scanned, truncated)
+
+    scope: 名称 / 名称+路径 / 文件内容
+    名称 支持 * ? [] 通配（不带通配符时按子串匹配，忽略大小写）
+    """
+    q = (query or "").strip()
+    if not q:
+        return [], 0, False
+    needle = q.lower()
+    use_glob = scope != "文件内容" and any(ch in q for ch in "*?[")
+    pat = re.compile(fnmatch.translate(q), re.IGNORECASE) if use_glob else None
+    content_scope = (scope == "文件内容")
+    hits, scanned, truncated, files_read = [], 0, False, 0
+    for base, dirs, files in os.walk(root):
+        if not include_hidden:
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+        dirs.sort(key=str.lower)
+        for nm in dirs + files:
+            scanned += 1
+            full = os.path.join(base, nm)
+            is_dir = nm in dirs
+            matched = False
+            if content_scope:
+                if not is_dir and files_read < FIND_CONTENT_MAXFILES:
+                    files_read += 1
+                    try:
+                        if 0 < os.path.getsize(full) <= FIND_CONTENT_MAXSIZE:
+                            with open(full, "rb") as f:
+                                blob = f.read().decode("utf-8", "ignore")
+                            matched = needle in blob.lower()
+                    except (OSError, UnicodeError):
+                        matched = False
+            elif pat is not None:
+                matched = bool(pat.search(nm))
+            else:
+                matched = needle in nm.lower()
+            if not matched and scope == "名称+路径":
+                try:
+                    rel = os.path.relpath(full, root).lower()
+                except ValueError:
+                    rel = full.lower()
+                # 相对路径、绝对路径、以及"上级目录/名字"三种写法都认
+                matched = (needle in rel or needle in full.lower()
+                           or needle in os.path.basename(base).lower() + "/" + nm.lower())
+            if matched:
+                hits.append({"path": full, "name": nm, "is_dir": is_dir})
+            if len(hits) >= limit:
+                return hits, scanned, True
+    return hits, scanned, truncated
+
+
+def fmt_time(ts):
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    except (OSError, OverflowError, ValueError):
+        return "-"
+
+
+def perm_text(st):
+    """-rwxr-xr-x (0755)"""
+    import stat as _stat
+    return f"{_stat.filemode(st.st_mode)} ({oct(st.st_mode & 0o777)[2:]})"
+
+
+def dir_usage(path, limit=300000):
+    """目录递归大小与条目数（受条目上限保护），返回 (bytes, items)"""
+    total, items = 0, 0
+    for base, dirs, files in os.walk(path):
+        for nm in dirs + files:
+            items += 1
+            try:
+                total += os.lstat(os.path.join(base, nm)).st_size
+            except OSError:
+                pass
+            if items >= limit:
+                return total, items
+    return total, items
+
+
+# ============ 打开方式（Open With）候选程序 ============
+# (标签, 需要哪个可执行文件, argv 前缀, 适用后缀元组或 None=全部)
+OPEN_WITH_CANDIDATES = [
+    ("文本查看（less）",            "less",   ["less", "-R"],   None),
+    ("编辑（nano）",                "nano",   ["nano", "-w"],   None),
+    ("编辑（nvim）",                "nvim",   ["nvim"],         None),
+    ("编辑（vim）",                 "vim",    ["vim"],          None),
+    ("逐页查看（more）",            "more",   ["more"],         None),
+    ("播放（mpv）",                 "mpv",    ["mpv"],          (".mp3", ".mp4", ".m4a", ".flac", ".wav", ".ogg", ".mkv", ".webm", ".avi")),
+    ("查看图片（termux-open）",     "termux-open", ["termux-open"], (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")),
+    ("Python 运行",                 "python3", ["python3"],     (".py",)),
+    ("Shell 执行",                  "sh",     ["sh"],           (".sh",)),
+    ("列出压缩包内容（tar -tvf）",  "tar",    ["tar", "-tvf"],  (".tar", ".tgz", ".tar.gz", ".gz", ".bz2", ".xz")),
+    ("十六进制查看（xxd）",         "xxd",    ["xxd"],          None),
+    ("音频播放（play-audio）",      "play-audio", ["play-audio"], (".mp3", ".wav", ".m4a", ".ogg")),
+    ("用系统应用打开（am start）",  "am",     ["am", "start", "-a", "android.intent.action.VIEW", "-d"], None),
+]
+
+
+PROG_LIST_CACHE = []
+
+
+def system_programs(refresh=False):
+    """扫描 PATH（含 Termux 的 $PREFIX/bin）里的可执行文件 -> [(名字, 绝对路径)]"""
+    global PROG_LIST_CACHE
+    if PROG_LIST_CACHE and not refresh:
+        return PROG_LIST_CACHE
+    dirs = [d for d in os.environ.get("PATH", "").split(os.pathsep) if d]
+    prefix = os.environ.get("PREFIX")
+    if prefix:
+        pb = os.path.join(prefix, "bin")
+        if pb not in dirs:
+            dirs.insert(0, pb)
+    for extra in ("/data/data/com.termux/files/usr/bin",
+                  "/usr/local/bin", "/usr/bin", "/bin"):
+        if extra not in dirs and os.path.isdir(extra):
+            dirs.append(extra)
+    seen, out = set(), []
+    for d in dirs:
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for nm in names:
+            if nm in seen or nm.startswith("."):
+                continue
+            full = os.path.join(d, nm)
+            try:
+                if os.path.isfile(full) and os.access(full, os.X_OK):
+                    seen.add(nm)
+                    out.append((nm, full))
+            except OSError:
+                continue
+    out.sort(key=lambda t: t[0].lower())
+    PROG_LIST_CACHE = out
+    return out
+
+
+def open_with_choices(paths):
+    """按文件类型 + Termux 实际装了哪些程序，生成「打开方式」候选列表"""
+    path = paths[0] if paths else ""
+    base = os.path.basename(path.rstrip("/")) or path
+    is_dir = os.path.isdir(path)
+    _, ext = os.path.splitext(base)
+    low_name = base.lower()
+    choices = []
+    # 第一条永远是"系统默认"
+    if shutil.which("termux-open"):
+        choices.append(("系统默认（termux-open）", ["termux-open", path], False))
+    elif shutil.which("xdg-open"):
+        choices.append(("系统默认（xdg-open）", ["xdg-open", path], False))
+    if is_dir:
+        choices.append(("看目录内容（ls -l）", ["ls", "-l", "--color=always", path], True))
+        return choices, ext
+    for label, need, argv, exts in OPEN_WITH_CANDIDATES:
+        if exts is not None:
+            if not any(low_name.endswith(e) for e in exts):
+                continue
+        if not shutil.which(need):
+            continue
+        detach = need in ("termux-open", "xdg-open", "am")
+        choices.append((label, list(argv) + [path], not detach))
+    if not choices:
+        choices.append(("（没有可用的程序，先 pkg install nano）", None, False))
+    choices.append(("其他…（搜索本机程序）", None, "browse"))
+    return choices, ext
+
+
+PROP_FIELDS = [
+    ("name",  "名称"),
+    ("perm",  "权限(八进制)"),
+    ("mtime", "修改时间"),
+]
+
+
+def parse_time_input(raw, cur_ts):
+    """把输入解析成时间戳：now / +3（天） / 2026-11-27 / 2026-11-27 15:30:00"""
+    s = (raw or "").strip()
+    low = s.lower()
+    if low in ("now", "今天", "现在"):
+        return time.time()
+    m = re.fullmatch(r"[+-]\d+", s)
+    if m:
+        return cur_ts + int(s) * 86400
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+FOLDOPTS = [
+    ("show_hidden", "显示隐藏的文件、文件夹或驱动器", "bool"),
+    ("hide_ext", "隐藏已知文件类型的扩展名", "bool"),
+    ("dirs_first", "文件夹排在文件前面", "bool"),
+    ("sort_key", "排序方式（名称/大小/修改日期/类型）", "cycle"),
+    ("sort_reverse", "反向排序（大→小 / 新→旧）", "bool"),
+    ("show_size", "列表显示大小列", "bool"),
+    ("show_mtime", "列表显示修改日期列", "bool"),
+    ("show_perm", "列表显示权限列", "bool"),
+]
+
+
+def perm_short(mode, is_dir):
+    if not mode:
+        return "----"
+    return ("d" if is_dir else "-") + f"{mode & 0o777:03o}"
+
+
+def sort_entries(entries, parent_entry=None):
+    """按 文件夹显示选项 过滤隐藏文件并排序；parent_entry 永远置顶"""
+    show_hidden = bool(PREFS.get("show_hidden", False))
+    dirs_first = bool(PREFS.get("dirs_first", True))
+    key = PREFS.get("sort_key", "name")
+    if key not in SORT_KEYS:
+        key = "name"
+    rev = bool(PREFS.get("sort_reverse", False))
+
+    head = [parent_entry] if parent_entry else []
+    tail = [e for e in entries if not e.get("is_parent_link")]
+    if not show_hidden:
+        tail = [e for e in tail if not str(e.get("name", "")).startswith(".")]
+
+    if key == "size":
+        kf = lambda e: (e.get("size") or 0)
+    elif key == "mtime":
+        kf = lambda e: (e.get("mtime") or 0.0)
+    elif key == "type":
+        kf = lambda e: (os.path.splitext(str(e.get("name", "")))[1].lower(),
+                        str(e.get("name", "")).lower())
+    else:
+        kf = lambda e: str(e.get("name", "")).lower()
+    tail.sort(key=kf, reverse=rev)
+    if dirs_first:
+        tail = ([e for e in tail if e.get("is_dir")]
+                + [e for e in tail if not e.get("is_dir")])
+    return head + tail
+
+
+def menu_hit_boxes():
+    """菜单栏文案的横向区间：[(x1, x2, 标题)]，供鼠标点选用"""
+    boxes = []
+    x = 0
+    for title, _items in MENUS:
+        boxes.append((x, x + len(title) + 1, title))
+        x += len(title) + 2
+    return boxes
+
+
+def folder_stats(path):
+    """文件夹直下一层的统计：文件数/目录数/总条目 + 所在分区剩余空间"""
+    files = dirs = 0
+    try:
+        with os.scandir(path) as it:
+            for _e in it:
+                if _e.is_dir(follow_symlinks=False):
+                    dirs += 1
+                else:
+                    files += 1
+    except OSError:
+        pass
+    free = total = None
+    try:
+        st = os.statvfs(path)
+        free = st.f_bavail * st.f_frsize
+        total = st.f_blocks * st.f_frsize
+    except OSError:
+        pass
+    return files, dirs, free, total
+
+
+def props_lines(paths):
+    """为选中项生成属性面板文本行"""
+    lines = []
+    head_count = len(paths)
+    if head_count > 1:
+        total = items = 0
+        for p in paths:
+            try:
+                if os.path.isdir(p) and not os.path.islink(p):
+                    b, n = dir_usage(p)
+                    total += b
+                    items += n
+                else:
+                    total += os.lstat(p).st_size
+                    items += 1
+            except OSError:
+                pass
+        lines.append(f"Selection     : {head_count} item(s)")
+        lines.append(f"Total size    : {human_size(total)}  ({total} bytes)")
+        lines.append(f"Items inside  : {items}")
+        lines.append("")
+    for p in paths[:12]:
+        name = os.path.basename(p.rstrip("/")) or p
+        lines.append(f"── {name}")
+        try:
+            lst = os.lstat(p)
+        except OSError as e:
+            lines.append(f"   status      : 无法读取（{getattr(e, 'strerror', None) or e}）")
+            continue
+        is_link = os.path.islink(p)
+        is_dir = os.path.isdir(p) and not is_link
+        kind = "目录" if is_dir else ("符号链接" if is_link else "文件")
+        lines.append(f"   type        : {kind}")
+        lines.append(f"   path        : {p}")
+        if is_link:
+            try:
+                lines.append(f"   link to     : {os.readlink(p)}")
+            except OSError:
+                pass
+        if is_dir:
+            b, n = dir_usage(p)
+            lines.append(f"   size        : {human_size(b)}  ({b} bytes, {n} items)")
+            files, dirs, free, total = folder_stats(p)
+            lines.append(f"   contents    : {files} 文件 / {dirs} 目录")
+            if free is not None:
+                lines.append(f"   disk free   : {human_size(free)} / {human_size(total)}"
+                             f"  ({100.0 * free / total:.0f}% 可用)")
+        else:
+            lines.append(f"   size        : {human_size(lst.st_size)}  ({lst.st_size} bytes)")
+        lines.append(f"   permission  : {perm_text(lst)}")
+        lines.append(f"   owner/group : {lst.st_uid} / {lst.st_gid}")
+        lines.append(f"   modified    : {fmt_time(lst.st_mtime)}")
+        lines.append(f"   accessed    : {fmt_time(lst.st_atime)}")
+        lines.append(f"   inode/links : {lst.st_ino} / {lst.st_nlink}")
+        parent = os.path.dirname(p.rstrip("/")) or "/"
+        try:
+            lines.append(f"   parent dir  : {parent} (writable={os.access(parent, os.W_OK)})")
+        except OSError:
+            pass
+        lines.append("")
+    if head_count > 12:
+        lines.append(f"… 其余 {head_count - 12} 项略")
+    return lines
+
+
+def pick_start_dir(start_mode, argv_dir):
+    """按策略挑选启动目录 -> (目录, 来源说明)
+
+    default=默认路径 / argv=命令行指定 / cwd=当前目录 / last=上次运行目录
+    显式命令行路径永远优先（此时来源记为命令行参数）。
+    """
+    if argv_dir:
+        return argv_dir, "命令行参数"
+    if start_mode not in START_MODES:
+        start_mode = "default"
+    if start_mode == "cwd":
+        return os.getcwd(), "当前目录"
+    if start_mode == "last":
+        last = PREFS.get("last_dir")
+        if last:
+            return last, "上次运行目录"
+        return PREFS.get("default_dir"), "上次运行目录(未记录→默认路径)"
+    if start_mode == "argv":
+        return PREFS.get("default_dir"), "默认路径(本次未给命令行参数)"
+    return PREFS.get("default_dir"), "默认路径"
+
+
+def resolve_start_path(raw):
+    """解析命令行路径 -> (目录, 预选文件或None, 提示信息)
+
+    规则：
+      · 目录 → 直接从该目录启动
+      · 文件 → 进入它所在目录，并预勾选这个文件
+      · 不存在 → 逐级向上回退到最近存在的父目录，返回提示，绝不抛异常
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None, None, ""
+    p = os.path.abspath(os.path.expanduser(raw))
+    if os.path.isfile(p):
+        return (os.path.dirname(p) or "/"), p, ""
+    if os.path.isdir(p):
+        return p, None, ""
+    miss = p
+    guard = 0
+    while not os.path.isdir(p) and guard < 256:
+        parent = os.path.dirname(p.rstrip("/")) or "/"
+        if parent == p:
+            break
+        p = parent
+        guard += 1
+    if os.path.isdir(p):
+        return p, None, f"启动路径不存在: {miss} → 已改用 {p}"
+    return None, None, f"启动路径不存在: {miss}"
+
+
 # ============ RAW stdin reader: UTF-8 chars + ANSI keys + mouse reports ============
 class RawKeyReader:
     def __init__(self):
@@ -252,9 +1047,39 @@ class RawKeyReader:
         if not self.buf:
             return None
 
+        # ESC 单独按下 vs ESC 引导的 Alt 组合：留 20ms 看看后面还有没有字节
+        if self.buf == b"\x1b":
+            if select.select([self.fd], [], [], 0.02)[0]:
+                try:
+                    more = os.read(self.fd, 32)
+                except OSError:
+                    more = b""
+                if more:
+                    self.buf += more
+
         b0 = self.buf[0]
 
+        # --- Alt + Backspace / Enter（Termux 发 ESC 前缀）---
+        if self.buf.startswith(b"\x1b\x7f") or self.buf.startswith(b"\x1b\x08"):
+            self.buf = self.buf[2:]
+            return "ALT_BS"
+        if self.buf.startswith(b"\x1b\r") or self.buf.startswith(b"\x1b\n"):
+            self.buf = self.buf[2:]
+            return "ALT_ENTER"
+
+        # --- Alt + 字母（Termux 发 ESC 前缀）：ESC + 可打印字符 → ALT_X ---
+        if self.buf.startswith(b"\x1b") and len(self.buf) > 1:
+            nxt = self.buf[1:2]
+            if 32 <= nxt[0] < 127 and nxt != b"[":
+                self.buf = self.buf[2:]
+                return "ALT_" + chr(nxt[0]).upper()
+
         # --- Mouse report: ESC [ < button ; x ; y M/m  (1006 mode) ---
+        double_esc = self.buf.startswith(b"\x1b\x1b")
+
+        if self.buf.startswith(b"\x1b\x1b"):
+            self.buf = self.buf[1:]   # 只留一个引导 ESC，继续按 CSI 解析
+
         if self.buf.startswith(b"\x1b[<"):
             endM = self.buf.find(b"M")
             endm = self.buf.find(b"m")
@@ -272,14 +1097,40 @@ class RawKeyReader:
             except Exception:
                 return None
 
-        # --- Arrow / other CSI ---
+        # --- CSI（可能带参数）：ESC[1;3D / ESC[5~ 等 ---
         if self.buf.startswith(b"\x1b["):
-            if len(self.buf) < 3:
-                return None
-            seq = self.buf[:3]
-            self.buf = self.buf[3:]
-            return {b"\x1b[A": "UP", b"\x1b[B": "DOWN",
-                    b"\x1b[C": "RIGHT", b"\x1b[D": "LEFT"}.get(seq, "ESC")
+            i = 2
+            while i < len(self.buf) and not (0x40 <= self.buf[i] <= 0x7e):
+                i += 1
+            if i >= len(self.buf):
+                return None          # 序列还没收完
+            seq = self.buf[:i + 1]
+            self.buf = self.buf[i + 1:]
+            final = chr(seq[-1])
+            params = seq[2:-1].decode("ascii", "ignore")
+            mod = 1
+            if ";" in params:
+                parts_mod = params.split(";")
+                try:
+                    mod = int(parts_mod[1] or 1)
+                except ValueError:
+                    mod = 1
+            arrow = {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT"}.get(final)
+            if arrow:
+                # 修饰符 3/4/5/6/7/8 = Alt/Alt+Shift/Ctrl/Ctrl+Shift/Ctrl+Alt/...
+                return ("ALT_" + arrow) if (mod >= 3 or double_esc) else arrow
+            if final == "H":
+                return ("ALT_HOME" if (mod >= 3 or double_esc) else "HOME")
+            if final == "F":
+                return ("ALT_END" if (mod >= 3 or double_esc) else "END")
+            pnum = params.rstrip("~")
+            if final == "~":
+                special = {"1": "HOME", "2": "INS", "3": "DELETE",
+                           "4": "END", "5": "PGUP", "6": "PGDN",
+                           "7": "HOME", "8": "END"}.get(pnum)
+                if special:
+                    return special
+            return "ESC"
 
         if b0 == 27:
             self.buf = self.buf[1:]
@@ -307,15 +1158,40 @@ class RawKeyReader:
 
 def tui_main(stdscr):
     curses.curs_set(0)
+    # raw()：让 ^C / ^X / ^V / ^F 这些控制字符进到读键逻辑，
+    # 而不是被内核当成 SIGINT。curses 退出时 endwin 会自动还原终端。
+    try:
+        curses.raw()
+    except curses.error:
+        pass
     stdscr.keypad(False)
     curses.mousemask(curses.ALL_MOUSE_EVENTS)
+    try:
+        if curses.has_colors():
+            curses.start_color()
+            try:
+                curses.use_default_colors()
+                bgc = -1
+            except curses.error:
+                bgc = curses.COLOR_BLACK
+            for k, fg in enumerate((curses.COLOR_GREEN, curses.COLOR_YELLOW,
+                                    curses.COLOR_CYAN, curses.COLOR_MAGENTA,
+                                    curses.COLOR_RED, curses.COLOR_CYAN)):
+                curses.init_pair(41 + k, fg, bgc)
+    except curses.error:
+        pass
     sys.stdout.write("\x1b[?1006h")
     sys.stdout.flush()
 
     global USE_SYSTEM_SHRED
-    SHRED_PASSES = 2
-    USE_SYSTEM_SHRED = True
-    current_pwd = os.path.abspath("/storage/emulated/0/Download/shred_test")
+    USE_SYSTEM_SHRED = bool(PREFS.get("use_system_shred", True))
+
+    # 启动目录策略：default=默认路径 / argv=命令行指定 / cwd=当前目录 / last=上次运行目录
+    start_mode = PREFS.get("start_mode", "last")
+    if start_mode not in START_MODES:
+        start_mode = "default"
+    seed_dir, seed_src = pick_start_dir(start_mode, START_DIR)
+    current_pwd = os.path.abspath(seed_dir or DEFAULT_START_DIR)
     old_pwd = current_pwd
 
     original_scan_entries = []
@@ -334,10 +1210,88 @@ def tui_main(stdscr):
     MODE_CONFIRM2 = "confirm2"
     MODE_SHREDDING = "shredding"
     MODE_CMDLINE = "cmdline"
+    MODE_ABOUT = "about"
+    MODE_PREFS = "prefs"
+    MODE_PREFS_EDIT = "prefs_edit"
+    MODE_CONFIG = "config"
+    MODE_CONFIG_EDIT = "config_edit"
+    MODE_PICK = "pick"          # 通用选择菜单（补全多候选 / 历史多匹配）
+    MODE_FIND = "find"          # Ctrl+F 递归搜索：输入关键词
+    MODE_FIND_RES = "findres"   # 搜索结果列表
+    MODE_PROPS = "props"        # Alt+Enter 属性面板
+    MODE_HELP = "help"          # ? 键位帮助
+    MODE_MENU = "menu"          # 菜单栏（File/Edit/View/Window/Help）
+    MODE_FOLDOPTS = "foldopts"  # 文件夹显示选项
+    MODE_TABNAME = "tabname"    # 重命名当前标签页
+    MODE_OPENWITH = "openwith"      # 打开方式选择框
+    MODE_OPENSEARCH = "opesearch"   # 「其他…」：搜索本机程序
+    MODE_PROPS_EDIT = "props_edit"     # 属性面板里按 I：选择要改的字段
+    MODE_PROPS_ENTRY = "props_entry"   # 改某个字段的输入框
     mode = MODE_LIST
 
+    prefs_cursor = 0
+    prefs_edit_buffer = ""
+    prefs_edit_cur = 0
+    settings_note = ""
+    cfg_cursor = 0
+    cfg_edit_buffer = ""
+    cfg_edit_cur = 0
+    cfg_note = ""
+
     cmd_buffer = ""
+    cmd_cur = 0
     cmd_error = ""
+    cmd_note = ""
+    cmd_search_mode = False      # Ctrl+R 反向搜索态
+    cmd_search_q = ""            # 搜索关键词（增量输入）
+    cmd_search_pos = None        # 当前命中的 hist_list 下标
+    cmd_search_matches = []      # 当前关键词的全部命中（新→旧，hist 下标）
+    cmd_search_sel = 0           # 菜单里选中的第几项
+
+    pick_items = []              # [(显示文本, 选中后写入的值)]
+    pick_sel = 0
+    pick_title = ""
+    pick_ctx = ""                # complete / hist
+    pick_prefix = ""             # 选完拼回 cmd_buffer 的前缀
+
+    clip_mode = ""               # "" / "copy" / "cut"
+    clip_items = []              # 内部剪贴板（绝对路径）
+    find_query = ""
+    find_cur = 0
+    find_hits = []
+    find_sel = 0
+    find_note = ""
+    find_scope_idx = 0           # 搜索范围：名称 / 名称+路径 / 文件内容
+    prop_text = []
+    prop_title = ""
+    prop_off = 0
+    prop_path = ""               # 当前属性面板对应的单个路径（多选时为空）
+    prop_edit_idx = 0            # 编辑时选中的字段
+    prop_edit_buf = ""           # 字段输入框内容
+    prop_cur = len(prop_edit_buf)
+    prop_cur = 0                 # 输入框光标位置
+    prop_msg = ""                # 属性编辑页提示
+    tabs = [None]                # 标签页快照（None 表示当前页还没落盘）
+    tab_idx = 0                  # 当前标签页下标
+    menu_idx = 0                 # 菜单栏当前展开的菜单
+    menu_sel = 0                 # 菜单里选中的条目
+    tab_boxes = []               # 底部标签栏每格的可点击区间 (x1,x2,idx,kind)
+    ow_items = []                # 打开方式候选 (label, argv|None, wait/browse)
+    ow_sel = 0
+    ow_path = ""                 # 打开方式的目标文件（第一个）
+    ow_targets = []              # 批量打开时的全部目标
+    ow_note = ""
+    ow_filter = ""               # 「其他…」程序搜索关键词
+    ow_cur = 0                   # 搜索框光标
+    ow_prog_sel = 0              # 搜索结果里选第几行
+    tab_name_buf = ""            # 标签页重命名输入框
+    tab_name_cur = 0
+    foldopts_idx = 0             # 显示选项页当前行
+    foldopts_note = ""           # 显示选项页提示
+    nav_hist = [current_pwd]     # 目录历史（浏览器式）
+    nav_idx = 0
+    nav_moving = False
+    nav_seen = current_pwd
     all_selected_entries = []
     total_file_list = []
     total_file_count = 0
@@ -373,10 +1327,143 @@ def tui_main(stdscr):
         except curses.error:
             pass
 
+    def put_input(y, x, prefix, buf, cur, suffix="", attr=0):
+        """渲染一行输入框，光标位置画反色块（在末尾时画反色空格）"""
+        cur = input_cursor(buf, cur)
+        head = prefix + buf[:cur]
+        under = buf[cur:cur + 1] or " "
+        tail = buf[cur + 1:] + suffix
+        put(y, x, head, attr)
+        cx = x + text_width(head)
+        put(y, cx, under, attr | curses.A_REVERSE)
+        if tail:
+            put(y, cx + 1, tail, attr)
+
+    def pick_geo(title, items, sel):
+        h, w = stdscr.getmaxyx()
+        return compute_pick_geo(title, items, sel, h, w)
+
+    def render_pick(title, items, sel, hint="↑↓选择 · ENTER确认 · ESC取消"):
+        """居中弹出菜单：标题 + 竖排候选，当前项反色"""
+        top, left, boxw, shown, off = pick_geo(title, items, sel)
+        inner_w = boxw - 2
+        put(top, left, "┌" + "─" * inner_w + "┐", curses.A_BOLD)
+        ttl = " " + clip(title, inner_w - 9) + f"  共{len(items)}项"
+        put(top + 1, left, "│", curses.A_BOLD)
+        put(top + 1, left + 1, clip(ttl, inner_w), curses.A_BOLD, maxcols=inner_w)
+        put(top + 1, left + boxw - 1, "│", curses.A_BOLD)
+        put(top + 2, left, "├" + "─" * inner_w + "┤", curses.A_BOLD)
+        for i in range(shown):
+            idx = off + i
+            row = top + 3 + i
+            put(row, left, "│", curses.A_BOLD)
+            if idx < len(items):
+                mark = "▶ " if idx == sel else "  "
+                line = clip(mark + items[idx][0], inner_w)
+                padn = inner_w - text_width(line)
+                attr = curses.A_REVERSE if idx == sel else curses.A_NORMAL
+                put(row, left + 1, line + " " * max(0, padn), attr, maxcols=inner_w)
+            else:
+                put(row, left + 1, " " * inner_w, 0, maxcols=inner_w)
+            put(row, left + boxw - 1, "│", curses.A_BOLD)
+        put(top + 3 + shown, left, "└" + "─" * inner_w + "┘", curses.A_BOLD)
+        hnow, wnow = stdscr.getmaxyx()
+        hint_row = min(top + 4 + shown, hnow - 2)
+        put(hint_row, left, clip(hint, wnow - left - 1), curses.A_DIM)
+        if off > 0:
+            put(top + 3, left + boxw - 1, "▲", curses.A_BOLD)
+        if off + shown < len(items):
+            put(top + 3 + shown - 1, left + boxw - 1, "▼", curses.A_BOLD)
+
     def set_status(msg):
         nonlocal status_msg, dirty
         status_msg = msg
         dirty = True
+
+    def remember_dir():
+        """把当前目录写入 last_dir，供“上次运行目录”模式下次使用"""
+        try:
+            if PREFS.get("last_dir") != current_pwd:
+                PREFS["last_dir"] = current_pwd
+                save_prefs()
+        except Exception:
+            pass
+
+    def reload_prefs_from_disk():
+        """按 R 键：丢弃内存中的值，重新从 JSON 读回（不改变当前所在目录）"""
+        global USE_SYSTEM_SHRED
+        PREFS.clear()
+        PREFS.update(load_prefs())
+        USE_SYSTEM_SHRED = bool(PREFS.get("use_system_shred", True))
+        return True
+
+    CMD_CANDIDATES = [
+        "cd", "select", "history", "history-clear", "hist",
+        "find", "props", "copy", "cut", "paste", "back", "fwd",
+        "about", "about:about", "about:preferences", "about:config",
+        "preferences", "prefs", "settings",
+        "tab", "menu", "dirprops", "opts",
+    ]
+
+    def path_complete(arg):
+        return complete_path(arg, current_pwd)
+
+    def open_pick(title, items, ctx, prefix=""):
+        """弹出选择菜单（ctx: complete=补全后回命令行）"""
+        nonlocal mode, pick_items, pick_sel, pick_title, pick_ctx, pick_prefix, dirty
+        pick_items = items
+        pick_sel = 0
+        pick_title = title
+        pick_ctx = ctx
+        pick_prefix = prefix
+        mode = MODE_PICK
+        dirty = True
+
+    def do_complete():
+        """Tab 键：先补命令名，cd 的参数走路径补全；多候选弹菜单选"""
+        nonlocal cmd_buffer, cmd_cur, cmd_note, dirty
+        buf = cmd_buffer
+        if " " not in buf:
+            cands = [c for c in CMD_CANDIDATES if c.startswith(buf.lower()) or c.startswith(buf)]
+            if not cands:
+                cmd_note = f"无命令补全: {buf}"
+            elif len(cands) == 1:
+                cmd_buffer = cands[0] + " "
+                cmd_cur = len(cmd_buffer)
+                cmd_note = f"补全 → {cands[0]}"
+            else:
+                common = os.path.commonprefix(cands)
+                if len(common) > len(buf):
+                    cmd_buffer = common
+                    cmd_cur = len(cmd_buffer)
+                cmd_note = ""
+                open_pick("命令补全", [(c, c + " ") for c in cands], "complete", "")
+            dirty = True
+            return
+
+        head, _, arg = buf.partition(" ")
+        if head.strip().lower() != "cd":
+            cmd_note = f"只有 cd 的路径支持 Tab 补全（当前: {head.strip()}）"
+            dirty = True
+            return
+        newarg, items, msg = path_complete(arg)
+        if newarg is not None:
+            cmd_buffer = head + " " + newarg
+            cmd_cur = len(cmd_buffer)
+        if len(items) > 1:
+            cmd_note = ""
+            open_pick(f"路径补全: {arg or '/'}", items, "complete", head + " ")
+        else:
+            cmd_note = msg
+        dirty = True
+
+    def cycle_start_mode(step):
+        """在 4 种启动路径策略之间循环（default / argv / cwd / last）"""
+        cur = PREFS.get("start_mode", "last")
+        if cur not in START_MODES:
+            cur = "default"
+        PREFS["start_mode"] = START_MODES[(START_MODES.index(cur) + step) % len(START_MODES)]
+        save_prefs()
 
     def scan_dir(path):
         """返回 (entries, err)。目录不可用/已镂空时 err 非空，绝不抛异常。"""
@@ -396,17 +1483,20 @@ def tui_main(stdscr):
             return None, f"无法访问（{getattr(e, 'strerror', None) or e}）"
 
         for name in sorted(names, key=lambda s: s.lower()):
+            if not PREFS.get("show_hidden", False) and name.startswith("."):
+                continue
             fullp = os.path.join(path, name)
             try:
                 is_dir = os.path.isdir(fullp)
-                if not is_dir:
-                    # 幽灵条目检测：listdir 之后又被删除的，直接不显示
-                    os.stat(fullp)
+                st = os.lstat(fullp)   # 幽灵条目检测 + 取大小/时间
             except OSError:
                 continue
-            entries.append({"path": fullp, "name": name,
-                            "is_dir": is_dir, "is_parent_link": False})
-        return entries, ""
+            entries.append({"path": fullp, "name": name, "is_dir": is_dir,
+                            "is_parent_link": False,
+                            "size": st.st_size, "mtime": st.st_mtime,
+                            "mode": st.st_mode})
+        parent = entries[0]
+        return sort_entries(entries, parent), ""
 
     def rescan_directory():
         nonlocal original_scan_entries, scan_entries, cursor_idx, view_offset
@@ -435,6 +1525,7 @@ def tui_main(stdscr):
             view_offset = 0
             selected_set.clear()
             set_status(f"路径不存在: {fallback_from or current_pwd}")
+            remember_dir()
             return
 
         rollback_note = ""
@@ -462,6 +1553,7 @@ def tui_main(stdscr):
                 view_offset = 0
                 selected_set.clear()
                 set_status(f"{err}；已回到根目录")
+                remember_dir()
                 return
 
         original_scan_entries.clear()
@@ -475,6 +1567,7 @@ def tui_main(stdscr):
         else:
             status_msg = ""
         dirty = True
+        remember_dir()
 
     def safe_enter_dir(target):
         """进入目录前先做镂空检测，失败只提示不崩溃"""
@@ -501,6 +1594,827 @@ def tui_main(stdscr):
         status_msg = ""
         rescan_directory()
         return True
+
+    # ============ 文件管理器操作：目标 / 剪贴板 / 目录历史 / 搜索 / 属性 ============
+    KEY_HELP = [
+        ("↑ ↓ / 滚轮", "移动光标；命令行里翻历史"),
+        ("SPACE / 点击行", "勾选 / 取消勾选"),
+        ("ENTER", "目录=进入；文件=预览后走粉碎流程"),
+        ("BACKSPACE", "把选中项直接送进粉碎确认（仍是两级确认）"),
+        ("Ctrl+C", "复制选中项到内部剪贴板"),
+        ("Ctrl+X", "剪切选中项"),
+        ("Ctrl+V", "把剪贴板粘贴到当前目录（同名自动加 (1)）"),
+        ("View → 文件夹显示选项", "显示隐藏的文件·文件夹·驱动器 / 隐藏已知扩展名 / 文件夹优先 / 排序 / 大小·日期·权限列"),
+        ("Ctrl+F 搜索（TAB 换范围）", "名称（支持 * ? 通配）→ 名称+路径 → 文件内容，涵盖隐藏项与子目录"),
+        ("ALT+R 打开方式", "对选中项列出本机已装程序（批量：多选后一起打开）；最后一项「其他…」可输名字搜索本机全部程序"),
+        ("ALT+T / ALT+C", "重命名当前标签页（也可 :tab rename 名字）/ 切换标签色彩标记"),
+        ("标签栏 ×", "点 × 关闭该标签页；右键标签切换颜色；[+] 新建"),
+        ("M / ALT+F..H", "打开菜单栏 File/Edit/View/Window/Help（←→ 换菜单，↑↓ 选项）"),
+        ("Ctrl+T / Ctrl+W", "新建标签页 / 关闭当前标签页"),
+        ("ALT+1..9", "切换到第 N 个标签页（也可点底部标签栏 / [+]）"),
+        ("ALT+← / ALT+BS", "返回上一个目录（可多级回退）"),
+        ("ALT+→", "前进到下一个目录"),
+        ("Ctrl+F", "当前文件夹内递归搜索名字"),
+        ("ALT+ENTER", "查看选中项属性（大小/权限/时间/inode）"),
+        ("I（属性页内）", "编辑属性：名称/权限/修改时间"),
+        ("←→ / HOME / END", "输入框内移动光标；DEL 删除光标右侧字符"),
+        ("/", "当前目录内快速筛选（不递归，n/N 跳匹配）"),
+        ("Tab", "命令行补全（命令名 / cd 路径，多候选弹菜单）"),
+        ("Ctrl+R / :hist", "反向搜索历史命令"),
+        (":", "命令行：cd / select / hist / about:preferences"),
+        ("R", "设置页与原表里：从磁盘重载配置"),
+        ("?", "本帮助"),
+        ("q", "退出程序"),
+    ]
+
+    def target_entries():
+        """选中项优先；未选中则取光标项 -> (entries, err)"""
+        ents = []
+        if selected_set:
+            for i in sorted(selected_set):
+                if 0 <= i < len(original_scan_entries):
+                    e = original_scan_entries[i]
+                    if not e.get("is_parent_link"):
+                        ents.append(e)
+        elif scan_entries:
+            e = scan_entries[min(cursor_idx, len(scan_entries) - 1)]
+            if e.get("is_parent_link"):
+                return [], "光标停在 “..” 上：先勾选项目或进入子目录"
+            ents.append(e)
+        if not ents:
+            return [], "没有可操作的项（先勾选文件或目录）"
+        return ents, ""
+
+    def clipboard_mark(kind):
+        nonlocal clip_mode, clip_items, dirty
+        ents, err = target_entries()
+        if err:
+            set_status(err)
+            return
+        clip_mode = kind
+        clip_items = [e["path"] for e in ents]
+        names = ", ".join(os.path.basename(p.rstrip("/")) for p in clip_items[:3])
+        if len(clip_items) > 3:
+            names += f" …(+{len(clip_items) - 3})"
+        set_status(f"📋 已{'复制' if kind == 'copy' else '剪切'} {len(clip_items)} 项: {names}"
+                   f"  → Ctrl+V 粘到当前目录")
+        dirty = True
+
+    def clipboard_paste():
+        nonlocal clip_mode, clip_items, dirty
+        if not clip_items:
+            set_status("剪贴板为空：先用 Ctrl+C 复制或 Ctrl+X 剪切")
+            dirty = True
+            return
+        mode_now = clip_mode or "copy"
+        ok, errs, skipped = 0, [], 0
+        for src in list(clip_items):
+            if not os.path.lexists(src):
+                errs.append(f"{os.path.basename(src)}: 源已不存在")
+                continue
+            sdir = os.path.dirname(src.rstrip("/"))
+            if mode_now == "cut" and sdir == current_pwd.rstrip("/"):
+                skipped += 1
+                continue
+            if os.path.isdir(src) and not os.path.islink(src):
+                base = src.rstrip("/") + "/"
+                if (current_pwd.rstrip("/") + "/").startswith(base):
+                    errs.append(f"{os.path.basename(src)}: 不能粘到它自身或子目录里")
+                    continue
+            if mode_now == "cut":
+                tgt, e = move_path(src, current_pwd)
+                
+            else:
+                tgt, e = copy_path(src, current_pwd)
+            if e:
+                errs.append(e)
+            else:
+                ok += 1
+                if mode_now == "cut":
+                    try:
+                        clip_items.remove(src)
+                    except ValueError:
+                        pass
+        if mode_now == "cut" and not clip_items:
+            clip_mode = ""
+        rescan_directory()
+        verb = "移动" if mode_now == "cut" else "复制"
+        msg = f"已{verb} {ok} 项 → {current_pwd}"
+        if skipped:
+            msg += f"，跳过 {skipped} 项（源与目标同一目录）"
+        if errs:
+            msg += "；失败: " + "；".join(errs[:2]) + (f" 等 {len(errs)} 项" if len(errs) > 2 else "")
+        set_status(msg)
+        dirty = True
+
+    def nav_jump(step):
+        """ALT+← / ALT+→：按目录历史前进后退"""
+        nonlocal current_pwd, old_pwd, nav_idx, nav_moving, nav_seen, nav_hist, dirty
+        if not nav_hist:
+            return
+        new = nav_idx + step
+        while 0 <= new < len(nav_hist) and not os.path.isdir(nav_hist[new]):
+            set_status(f"历史里的目录已不存在，跳过: {nav_hist[new]}")
+            nav_hist.pop(new)
+            if step < 0 and nav_idx > new:
+                nav_idx -= 1
+            if not (0 <= new < len(nav_hist)):
+                return
+        if not (0 <= new < len(nav_hist)):
+            set_status("已经是第一个目录了" if step < 0 else "已经是最后一个目录了")
+            dirty = True
+            return
+        nav_moving = True
+        nav_idx = new
+        old_pwd = current_pwd
+        current_pwd = nav_hist[new]
+        rescan_directory()
+        nav_moving = False
+        nav_seen = current_pwd
+        set_status(f"{'← 返回' if step < 0 else '→ 前进'}: {current_pwd}  "
+                   f"[{nav_idx + 1}/{len(nav_hist)}]")
+        dirty = True
+
+    def run_find():
+        nonlocal find_hits, find_sel, find_note, mode, dirty
+        q = find_query.strip()
+        scope = FIND_SCOPES[max(0, min(len(FIND_SCOPES) - 1, find_scope_idx))]
+        if not q:
+            find_note = "请输入关键词（支持中文、* ? 通配、不区分大小写）"
+            dirty = True
+            return
+        hits, scanned, truncated = folder_find(current_pwd, q, scope=scope)
+        find_hits = hits
+        find_sel = 0
+        find_note = f"[{scope}] 「{q}」命中 {len(hits)} 项 / 扫描 {scanned} 项"
+        if truncated:
+            find_note += "（已达 800 上限，结果可能不全）"
+        mode = MODE_FIND_RES
+        dirty = True
+
+    def find_window(max_lines):
+        """搜索结果的滚动起点（保证 find_sel 可见）"""
+        if not find_hits or max_lines < 1:
+            return 0
+        off = max(0, find_sel - max_lines + 1)
+        return min(off, max(0, len(find_hits) - max_lines))
+
+    def goto_find_hit(hit):
+        nonlocal cursor_idx, view_offset, mode, dirty
+        p = hit["path"]
+        target = p if hit["is_dir"] else (os.path.dirname(p) or "/")
+        if not safe_enter_dir(target):
+            return
+        mode = MODE_LIST
+        found = False
+        for i, e in enumerate(scan_entries):
+            if e["path"] == p:
+                cursor_idx = i
+                selected_set.add(i)
+                _scroll_to(i)
+                found = True
+                break
+        if hit["is_dir"]:
+            set_status(f"已进入目录: {p}")
+        elif found:
+            set_status(f"已定位并勾选: {os.path.basename(p)}")
+        else:
+            set_status(f"已进入 {target}，但目标已被移走")
+        dirty = True
+
+    def current_targets():
+        ents, err = target_entries()
+        if err:
+            return [], err
+        ents = [e for e in ents if not e.get("is_parent_link")]
+        if not ents:
+            return [], "请先选中一个文件/目录"
+        return [e["path"] for e in ents], ""
+
+    def open_openwith():
+        nonlocal ow_items, ow_sel, ow_targets, ow_path, ow_note, mode, dirty
+        paths, err = current_targets()
+        if err:
+            set_status(err)
+            return
+        ow_targets = paths
+        ow_path = paths[0]
+        ow_items, _ext = open_with_choices(paths)
+        ow_sel = 0
+        if len(paths) == 1:
+            ow_note = "目标: " + (os.path.basename(paths[0].rstrip("/")) or paths[0])
+        else:
+            first = os.path.basename(paths[0].rstrip("/"))
+            ow_note = f"批量：{len(paths)} 项（{first} 等）"
+        mode = MODE_OPENWITH
+        dirty = True
+
+    def open_prog_search():
+        """「其他…」：程序搜索框（输入即筛选）"""
+        nonlocal ow_filter, ow_cur, ow_prog_sel, mode, dirty
+        ow_filter = ""
+        ow_cur = 0
+        ow_prog_sel = 0
+        system_programs()          # 首次扫描后缓存
+        mode = MODE_OPENSEARCH
+        dirty = True
+
+    def filtered_programs():
+        progs = system_programs()
+        q = ow_filter.strip().lower()
+        if not q:
+            return progs
+        return [(n, p) for (n, p) in progs if q in n.lower()]
+
+    def launch_program(prefix, wait_it=True):
+        """用 prefix（[程序, 固定参数...]）打开 ow_targets 里的全部目标"""
+        nonlocal mode, dirty
+        targets = ow_targets or [ow_path]
+        if not prefix:
+            return
+        prog_name = os.path.basename(prefix[0])
+        if not wait_it:
+            # 交给系统/图形界面（termux-open、xdg-open、am start）：不等待、不接管终端
+            # 批量时逐个文件分别拉起（这类程序通常一次只吃一个路径）
+            fails = 0
+            for t in targets:
+                try:
+                    subprocess.Popen(list(prefix) + [t],
+                                     stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL,
+                                     start_new_session=True)
+                except (OSError, ValueError):
+                    fails += 1
+            if fails:
+                set_status(f"批量打开：{fails}/{len(targets)} 项启动失败")
+            else:
+                set_status(f"已交给「{prog_name}」打开 {len(targets)} 项")
+            mode = MODE_LIST
+            dirty = True
+            return
+        argv = list(prefix) + list(targets)
+        # 交出终端：endwin 恢复 cooked 模式，让 less/nano/mpv 正常接管
+        try:
+            curses.def_prog_mode()
+            curses.endwin()
+        except curses.error:
+            pass
+        rc = 0
+        try:
+            sys.stdout.write("\x1b[?1006l\x1b[?1000l\x1b[?25h")
+            sys.stdout.flush()
+            rc = subprocess.call(argv, cwd=(os.path.dirname(targets[0]) or None))
+        except (OSError, ValueError) as exc:
+            rc = -1
+            print(f"\n启动失败: {exc}")
+            time.sleep(1.2)
+        finally:
+            try:
+                curses.reset_prog_mode()
+                curses.mousemask(curses.ALL_MOUSE_EVENTS)
+                sys.stdout.write("\x1b[?1006h")
+                sys.stdout.flush()
+                curses.curs_set(0)
+            except curses.error:
+                pass
+            stdscr.erase()
+            stdscr.refresh()
+            mode = MODE_LIST
+            dirty = True
+            if len(targets) == 1:
+                set_status(f"已用「{prog_name}」打开 "
+                           f"{os.path.basename(targets[0])}（退出码 {rc}）")
+            else:
+                set_status(f"已用「{prog_name}」批量打开 "
+                           f"{len(targets)} 项（退出码 {rc}）")
+
+    def run_open_with(idx=None):
+        nonlocal mode, dirty
+        if idx is None:
+            idx = ow_sel
+        if not ow_items or idx < 0 or idx >= len(ow_items):
+            return
+        item = ow_items[idx]
+        prefix = item[1]
+        flag = item[2] if len(item) > 2 else True
+        if flag == "browse":
+            open_prog_search()
+            return
+        if not prefix:
+            set_status("这一项没有可用程序")
+            return
+        set_status(f"正在用「{os.path.basename(prefix[0])}」打开 "
+                   f"{len(ow_targets or [ow_path])} 项…")
+        dirty = True
+        launch_program(prefix, bool(flag))
+
+    def run_searched_program():
+        nonlocal mode, dirty
+        progs = filtered_programs()
+        if not progs:
+            set_status("没有匹配的程序")
+            return
+        idx = max(0, min(len(progs) - 1, ow_prog_sel))
+        path = progs[idx][1]
+        set_status(f"正在用「{os.path.basename(path)}」打开…")
+        dirty = True
+        # 搜索出来的程序一律按"终端程序"处理（等它退出后回列表）
+        launch_program([path], True)
+
+    def open_props():
+        nonlocal prop_text, prop_title, prop_path, prop_off, prop_msg, mode, dirty
+        ents, err = target_entries()
+        if err:
+            set_status(err)
+            return
+        paths = [e["path"] for e in ents]
+        prop_text = props_lines(paths)
+        prop_title = (os.path.basename(paths[0].rstrip("/")) if len(paths) == 1
+                      else f"{len(paths)} 项选中")
+        prop_path = paths[0] if len(paths) == 1 else ""
+        prop_off = 0
+        prop_msg = ""
+        mode = MODE_PROPS
+        dirty = True
+
+    # ---------------- 标签页 ----------------
+    def tab_title(i):
+        d = tabs[i] if i < len(tabs) and tabs[i] else None
+        if d and (d.get("name") or "").strip():
+            return d["name"]
+        path = (d["cwd"] if d else (current_pwd if i == tab_idx else "/"))
+        return os.path.basename(path.rstrip("/")) or path
+
+    def tab_color(i):
+        d = tabs[i] if i < len(tabs) and tabs[i] else None
+        try:
+            c = int(d.get("color", 0)) if d else 0
+        except (TypeError, ValueError):
+            c = 0
+        return c if 0 <= c < len(TAB_COLOR_NAMES) else 0
+
+    def tab_attr(i, active):
+        attr = curses.A_NORMAL
+        c = tab_color(i)
+        if c and curses.has_colors():
+            try:
+                attr |= curses.color_pair(TAB_COLOR_PAIRS[c])
+            except curses.error:
+                pass
+        return attr | (curses.A_REVERSE | curses.A_BOLD if active else 0)
+
+    def tab_snapshot():
+        nonlocal tabs
+        prev = tabs[tab_idx] if tab_idx < len(tabs) and tabs[tab_idx] else {}
+        tabs[tab_idx] = {
+            "name": prev.get("name", ""),
+            "color": prev.get("color", 0),
+            "cwd": current_pwd,
+            "orig": list(original_scan_entries),
+            "entries": list(scan_entries),
+            "cursor": cursor_idx,
+            "sel": set(selected_set),
+            "view": view_offset,
+            "search_mode": search_mode,
+            "search_kw": search_keyword,
+            "matches": list(search_matches),
+            "match_idx": current_match_idx,
+            "nav_hist": list(nav_hist),
+            "nav_idx": nav_idx,
+            "nav_seen": nav_seen,
+        }
+
+    def tab_load(d):
+        nonlocal current_pwd, original_scan_entries, scan_entries, cursor_idx, selected_set
+        nonlocal view_offset, search_mode, search_keyword, search_matches, current_match_idx
+        nonlocal nav_hist, nav_idx, nav_seen, status_msg, dirty
+        current_pwd = d["cwd"]
+        original_scan_entries = list(d["orig"])
+        scan_entries = list(d["entries"])
+        cursor_idx = d["cursor"] if d["entries"] else 0
+        selected_set = set(d["sel"])
+        view_offset = d["view"]
+        search_mode = d["search_mode"]
+        search_keyword = d["search_kw"]
+        search_matches = list(d["matches"])
+        current_match_idx = d["match_idx"]
+        nav_hist = list(d["nav_hist"])
+        nav_idx = d["nav_idx"]
+        nav_seen = d["nav_seen"]
+        status_msg = ""
+        dirty = True
+        if not scan_entries:
+            rescan_directory()
+
+    def switch_tab(i):
+        nonlocal tab_idx
+        if not tabs or i < 0 or i >= len(tabs) or i == tab_idx:
+            return
+        tab_snapshot()
+        tab_idx = i
+        tab_load(tabs[i])
+
+    def new_tab(path=None):
+        nonlocal tabs, tab_idx, dirty
+        if len(tabs) >= 9:
+            set_status("最多 9 个标签页")
+            return
+        tab_snapshot()
+        target = os.path.abspath(os.path.expanduser(path)) if path else current_pwd
+        if not os.path.isdir(target):
+            target = current_pwd
+        tabs.append({
+            "name": "", "color": 0,
+            "cwd": target, "orig": [], "entries": [], "cursor": 0, "sel": set(),
+            "view": 0, "search_mode": False, "search_kw": "", "matches": [],
+            "match_idx": 0, "nav_hist": [target], "nav_idx": 0, "nav_seen": target,
+        })
+        tab_idx = len(tabs) - 1
+        tab_load(tabs[tab_idx])
+        rescan_directory()
+        set_status(f"新建标签页 {tab_idx + 1}/{len(tabs)}: {target}")
+
+    def close_tab():
+        nonlocal tabs, tab_idx
+        if len(tabs) <= 1:
+            set_status("只剩一个标签页，无法关闭")
+            return
+        tabs.pop(tab_idx)
+        if tab_idx >= len(tabs):
+            tab_idx = len(tabs) - 1
+        tab_load(tabs[tab_idx])
+        set_status(f"已关闭，剩余 {len(tabs)} 个标签页")
+
+    def open_tab_rename():
+        nonlocal tab_name_buf, tab_name_cur, mode, dirty
+        tab_name_buf = tab_title(tab_idx)
+        tab_name_cur = len(tab_name_buf)
+        mode = MODE_TABNAME
+        dirty = True
+
+    def apply_tab_rename():
+        nonlocal mode, dirty
+        nm = tab_name_buf.strip()
+        if tab_idx < len(tabs) and tabs[tab_idx]:
+            tabs[tab_idx]["name"] = nm
+        else:
+            tabs[tab_idx] = tabs[tab_idx] or {}
+            tabs[tab_idx]["name"] = nm
+        mode = MODE_LIST
+        set_status(f"标签页 {tab_idx + 1} 重命名为: {nm}" if nm
+                   else f"标签页 {tab_idx + 1} 恢复默认名称")
+        dirty = True
+
+    def tab_cycle_color(step=1):
+        nonlocal dirty
+        if tab_idx >= len(tabs):
+            return
+        if tabs[tab_idx] is None:
+            tab_snapshot()
+        cur = tab_color(tab_idx)
+        newc = (cur + step) % len(TAB_COLOR_NAMES)
+        tabs[tab_idx]["color"] = newc
+        set_status(f"标签页 {tab_idx + 1} 颜色: {TAB_COLOR_NAMES[newc]}")
+        dirty = True
+
+    def close_specific_tab(i):
+        nonlocal tabs, tab_idx
+        if len(tabs) <= 1:
+            set_status("只剩一个标签页，无法关闭")
+            return
+        if i == tab_idx:
+            close_tab()
+            return
+        tabs.pop(i)
+        if i < tab_idx:
+            tab_idx -= 1
+        set_status(f"已关闭标签页 {i + 1}，剩余 {len(tabs)} 个")
+
+    def next_tab():
+        switch_tab((tab_idx + 1) % len(tabs))
+
+    def prev_tab():
+        switch_tab((tab_idx - 1) % len(tabs))
+
+    # ---------------- 选择集助手 ----------------
+    def select_all_entries():
+        nonlocal dirty
+        selected_set.clear()
+        for i, e in enumerate(original_scan_entries):
+            if not e.get("is_parent_link"):
+                selected_set.add(i)
+        set_status(f"已全选 {len(selected_set)} 项")
+        dirty = True
+
+    def clear_selection():
+        nonlocal dirty
+        selected_set.clear()
+        set_status("已清空选择")
+        dirty = True
+
+    def invert_selection():
+        nonlocal dirty
+        selected_set.clear()
+        for i, e in enumerate(original_scan_entries):
+            if not e.get("is_parent_link"):
+                selected_set.add(i)
+        set_status(f"已反选，当前选中 {len(selected_set)} 项")
+        dirty = True
+
+    def clear_clipboard():
+        nonlocal clip_items, clip_mode, dirty
+        clip_items = []
+        clip_mode = ""
+        set_status("剪贴板已清空")
+        dirty = True
+
+    def open_folder_props():
+        """当前所在文件夹的属性（含递归大小/条目数/分区剩余）"""
+        nonlocal prop_text, prop_title, prop_path, prop_off, prop_msg, mode, dirty
+        target = current_pwd
+        prop_text = props_lines([target])
+        prop_title = os.path.basename(target.rstrip("/")) or target
+        prop_path = target
+        prop_off = 0
+        prop_msg = ""
+        mode = MODE_PROPS
+        dirty = True
+
+    def refresh_after_options():
+        """显示选项变化后：其他标签页作废，当前目录重扫"""
+        nonlocal tabs, dirty
+        for i in range(len(tabs)):
+            if tabs[i] is not None and i != tab_idx:
+                tabs[i]["entries"] = []
+                tabs[i]["orig"] = []
+        rescan_directory()
+        set_status("显示选项已保存并生效")
+        dirty = True
+
+    def open_foldopts():
+        nonlocal mode, foldopts_idx, foldopts_note, dirty
+        mode = MODE_FOLDOPTS
+        foldopts_idx = 0
+        foldopts_note = ""
+        dirty = True
+
+    def foldopt_value_text(key, kind):
+        if kind == "cycle":
+            return SORT_LABELS.get(PREFS.get(key, "name"), "名称")
+        return "ON " if PREFS.get(key) else "OFF"
+
+    def foldopt_toggle(key, kind, step=1):
+        nonlocal foldopts_note, dirty
+        if kind == "cycle":
+            cur = PREFS.get(key, "name")
+            if cur not in SORT_KEYS:
+                cur = "name"
+            PREFS[key] = SORT_KEYS[(SORT_KEYS.index(cur) + step) % len(SORT_KEYS)]
+            foldopts_note = f"排序方式 → {SORT_LABELS[PREFS[key]]}"
+        else:
+            PREFS[key] = not bool(PREFS.get(key))
+            foldopts_note = f"{key} → {'ON' if PREFS[key] else 'OFF'}"
+        save_prefs()
+        refresh_after_options()
+
+    def foldopts_reset():
+        nonlocal foldopts_note, dirty
+        for key in ("show_hidden", "hide_ext", "dirs_first", "sort_key",
+                    "sort_reverse", "show_size", "show_mtime", "show_perm"):
+            PREFS[key] = DEFAULT_PREFS[key]
+        save_prefs()
+        refresh_after_options()
+        foldopts_note = "已恢复默认显示选项"
+        dirty = True
+
+    def open_menu(i=0):
+        nonlocal mode, menu_idx, menu_sel, dirty
+        menu_idx = max(0, min(len(MENUS) - 1, i))
+        menu_sel = 0
+        mode = MODE_MENU
+        dirty = True
+
+    def menu_action(act):
+        """执行菜单条目；返回 True 表示要退出程序"""
+        nonlocal mode, find_query, find_cur, find_note, dirty
+        nonlocal cmd_buffer, cmd_cur, cmd_error, cmd_note, cmd_search_mode
+        nonlocal cmd_search_q, cmd_search_pos, cmd_hist_idx, cmd_draft
+        if act == "quit":
+            return True
+        if act == "new_tab":
+            new_tab()
+        elif act == "dup_tab":
+            new_tab(current_pwd)
+        elif act == "close_tab":
+            close_tab()
+        elif act == "next_tab":
+            next_tab()
+        elif act == "prev_tab":
+            prev_tab()
+        elif act == "openwith":
+            open_openwith()
+        elif act == "tab_rename":
+            open_tab_rename()
+        elif act == "tab_color":
+            tab_cycle_color(1)
+        elif act == "tab_list":
+            open_pick("标签页", [(f"{i + 1}. {tab_title(i)}"
+                                  f"{'  ←当前' if i == tab_idx else ''}", i)
+                                 for i in range(len(tabs))], "tab", "")
+        elif act == "copy":
+            clipboard_mark("copy")
+        elif act == "cut":
+            clipboard_mark("cut")
+        elif act == "paste":
+            clipboard_paste()
+        elif act == "shred":
+            shred_from_selection()
+        elif act == "props":
+            open_props()
+        elif act == "dirprops":
+            open_folder_props()
+        elif act == "folderopts":
+            open_foldopts()
+        elif act == "toggle_hidden":
+            PREFS["show_hidden"] = not bool(PREFS.get("show_hidden"))
+            save_prefs()
+            refresh_after_options()
+            set_status(f"显示隐藏文件: {'ON' if PREFS['show_hidden'] else 'OFF'}")
+        elif act == "toggle_ext":
+            PREFS["hide_ext"] = not bool(PREFS.get("hide_ext"))
+            save_prefs()
+            refresh_after_options()
+            set_status(f"隐藏已知文件类型的扩展名: "
+                       f"{'ON' if PREFS['hide_ext'] else 'OFF'}")
+        elif act == "toggle_dirsfirst":
+            PREFS["dirs_first"] = not bool(PREFS.get("dirs_first", True))
+            save_prefs()
+            refresh_after_options()
+            set_status(f"文件夹优先: {'ON' if PREFS['dirs_first'] else 'OFF'}")
+        elif act == "cycle_sort":
+            cur = PREFS.get("sort_key", "name")
+            if cur not in SORT_KEYS:
+                cur = "name"
+            PREFS["sort_key"] = SORT_KEYS[(SORT_KEYS.index(cur) + 1) % len(SORT_KEYS)]
+            save_prefs()
+            refresh_after_options()
+            set_status(f"排序方式: {SORT_LABELS[PREFS['sort_key']]}")
+        elif act == "select_all":
+            select_all_entries()
+        elif act == "clear_sel":
+            clear_selection()
+        elif act == "invert_sel":
+            invert_selection()
+        elif act == "clear_clip":
+            clear_clipboard()
+        elif act == "find":
+            mode = MODE_FIND
+            find_query = ""
+            find_cur = len(find_query)
+            find_note = ""
+        elif act == "refresh":
+            rescan_directory()
+            set_status("已刷新")
+        elif act == "up_dir":
+            safe_enter_dir(os.path.dirname(current_pwd.rstrip("/")) or "/")
+        elif act == "back":
+            nav_jump(-1)
+        elif act == "fwd":
+            nav_jump(1)
+        elif act == "help":
+            mode = MODE_HELP
+        elif act == "about":
+            mode = MODE_ABOUT
+        elif act == "prefs":
+            mode = MODE_PREFS
+        elif act == "version":
+            mode = MODE_ABOUT
+        elif act == "open_path":
+            mode = MODE_CMDLINE
+            cmd_buffer = "cd "
+            cmd_cur = len(cmd_buffer)
+            cmd_error = ""
+            cmd_note = ""
+            cmd_search_mode = False
+            cmd_search_q = ""
+            cmd_search_pos = None
+            cmd_hist_idx = len(hist_list)
+            cmd_draft = ""
+        dirty = True
+        return False
+
+    def prop_field_value(field):
+        """取当前路径某个可编辑字段的显示值（真读磁盘，失败给空）"""
+        try:
+            st = os.lstat(prop_path)
+        except OSError:
+            return ""
+        if field == "name":
+            return os.path.basename(prop_path.rstrip("/"))
+        if field == "perm":
+            return oct(st.st_mode & 0o777)[2:]
+        if field == "mtime":
+            return fmt_time(st.st_mtime)
+        return ""
+
+    def refresh_props():
+        nonlocal prop_text
+        prop_text = props_lines([prop_path])
+
+    def enter_props_edit():
+        nonlocal mode, prop_edit_idx, prop_msg, dirty
+        if not prop_path:
+            prop_msg = ("属性编辑只支持单选：按 ESC 回列表，取消其余勾选只留一个，"
+                        "再 Alt+Enter / :props 打开")
+            dirty = True
+            return
+        if not os.path.lexists(prop_path):
+            set_status("项目已不存在，无法编辑")
+            return
+        prop_edit_idx = 0
+        prop_msg = ""
+        mode = MODE_PROPS_EDIT
+        dirty = True
+
+    def begin_prop_entry():
+        nonlocal mode, prop_edit_buf, prop_cur, prop_msg, dirty
+        field = PROP_FIELDS[prop_edit_idx][0]
+        prop_edit_buf = prop_field_value(field)
+        prop_cur = len(prop_edit_buf)
+        prop_msg = "输入新值后 ENTER 保存，ESC 放弃"
+        mode = MODE_PROPS_ENTRY
+        dirty = True
+
+    def apply_prop_edit():
+        """把 prop_edit_buf 应用到当前字段 -> (ok, msg)"""
+        nonlocal prop_path, prop_title, prop_msg, dirty
+        field = PROP_FIELDS[prop_edit_idx][0]
+        raw = prop_edit_buf.strip()
+        if not raw:
+            return False, "值不能为空"
+        parent = os.path.dirname(prop_path.rstrip("/")) or "/"
+        if field == "name":
+            if "/" in raw or raw in (".", ".."):
+                return False, "名称不能包含 /，也不能是 . 或 .."
+            target = os.path.join(parent, raw)
+            if target == prop_path:
+                return True, "名称未变"
+            if os.path.lexists(target):
+                return False, f"同名已存在: {raw}"
+            try:
+                os.rename(prop_path, target)
+            except PermissionError:
+                return False, "无权限重命名（Android 存储目录常见，检查 MANAGE_EXTERNAL_STORAGE）"
+            except OSError as e:
+                return False, f"重命名失败: {getattr(e, 'strerror', None) or e}"
+            prop_path = target
+            prop_title = raw
+            rescan_directory()
+            return True, f"已重命名为 {raw}"
+        st = None
+        try:
+            st = os.lstat(prop_path)
+        except OSError as e:
+            return False, f"无法读取属性: {getattr(e, 'strerror', None) or e}"
+        if field == "perm":
+            digits = raw.lower().lstrip("0o") if raw.lower().startswith(("0o", "0x")) else raw
+            try:
+                val = int(digits, 8)
+            except ValueError:
+                return False, "权限要写成八进制，例如 644 / 755 / 600"
+            if val < 0 or val > 0o7777:
+                return False, "权限范围 0000-7777"
+            try:
+                os.chmod(prop_path, val)
+            except PermissionError:
+                return False, "无权限修改权限位（Android 上基本改不了，属正常）"
+            except OSError as e:
+                return False, f"chmod 失败: {getattr(e, 'strerror', None) or e}"
+            return True, f"权限已改为 {oct(val)[2:]}"
+        if field == "mtime":
+            ts = parse_time_input(raw, st.st_mtime)
+            if ts is None:
+                return False, "时间格式：2026-11-27 / 2026-11-27 15:30:00 / +3（天后） / now"
+            try:
+                os.utime(prop_path, (st.st_atime, ts))
+            except PermissionError:
+                return False, "无权限修改时间"
+            except OSError as e:
+                return False, f"utime 失败: {getattr(e, 'strerror', None) or e}"
+            return True, f"修改时间已改为 {fmt_time(ts)}"
+        return False, "该字段不可编辑"
+
+    def shred_from_selection():
+        """BACKSPACE：选中项直接进粉碎确认流程（不绕过两级确认）"""
+        nonlocal all_selected_entries, mode, dirty
+        ents, err = target_entries()
+        if err:
+            set_status(err)
+            return
+        all_selected_entries = ents
+        mode = MODE_CONFIRM1
+        dirty = True
 
     def compute_search_matches(kw):
         kw_low = kw.lower()
@@ -661,7 +2575,30 @@ def tui_main(stdscr):
 
     rescan_directory()
 
+    # 命令行参数是文件 → 定位到它并预勾选
+    if START_FILE:
+        base = os.path.basename(START_FILE)
+        for i, e in enumerate(original_scan_entries):
+            if e.get("is_parent_link"):
+                continue
+            if e["name"] == base:
+                cursor_idx = i
+                selected_set.add(i)
+                _scroll_to(i)
+                set_status(f"启动参数已定位: {START_FILE}")
+                break
+        else:
+            set_status(f"启动参数中的文件不在当前目录: {START_FILE}")
+
     while True:
+        # 任何来源的目录切换（ENTER 进目录 / cd / cd - / 镂空回退）都记入历史
+        if not nav_moving and current_pwd != nav_seen:
+            nav_hist = nav_hist[:nav_idx + 1]
+            if not nav_hist or nav_hist[-1] != current_pwd:
+                nav_hist.append(current_pwd)
+            nav_idx = len(nav_hist) - 1
+            nav_seen = current_pwd
+
         if dirty:
             stdscr.erase()
             h, w = stdscr.getmaxyx()
@@ -676,12 +2613,26 @@ def tui_main(stdscr):
                                          "x1": bx, "x2": bx + b_len - 1})
                 bx += b_len + gap
 
-            if mode == MODE_LIST:
-                title = (f"🔍 SEARCH | PWD: {current_pwd} | ENTER=confirm,ESC=cancel"
-                         if search_mode else
-                         "📂 FileShredder | /搜索 :命令 n=下匹配 N=上匹配")
-                put(0, 0, title, curses.A_BOLD)
-                put(1, 0, "-" * len(clip(title, w - 1)))
+            if mode in (MODE_LIST, MODE_MENU):
+                clip_tag = ""
+                if clip_items:
+                    clip_tag = f" | 📋{len(clip_items)}{'✂' if clip_mode == 'cut' else ''}"
+                # 顶部菜单栏 File / Edit / View / Window / Help
+                menu_x = []
+                mx = 0
+                active_menu = menu_idx if mode == MODE_MENU else -1
+                for mi, (mtitle, _its) in enumerate(MENUS):
+                    menu_x.append(mx)
+                    put(0, mx, f" {mtitle} ",
+                        curses.A_REVERSE if mi == active_menu else curses.A_BOLD)
+                    mx += len(mtitle) + 2
+                if search_mode:
+                    trail = f"│ 🔍 /{search_keyword} ENTER=确认 ESC=取消"
+                else:
+                    trail = f"│ 📂 {current_pwd}{clip_tag}"
+                put(0, mx + 1, clip(trail, max(0, w - mx - len(VERSION) - 4)))
+                put(0, max(0, w - len(VERSION) - 2), VERSION, curses.A_DIM)
+                put(1, 0, "-" * (w - 1))
 
                 max_lines = btn_row - 4
                 if max_lines < 1:
@@ -700,30 +2651,108 @@ def tui_main(stdscr):
                     ent = scan_entries[ri]
                     marker = "[✓]" if ri in selected_set else "[ ]"
                     if ent.get("is_parent_link"):
-                        icon = "⬆️"
+                        icon = "⬆"
                     elif ent["is_dir"]:
                         icon = "📁"
                     else:
                         icon = "📄"
                     attr = curses.A_REVERSE if ri == cursor_idx else curses.A_NORMAL
-                    put(2 + di, 0, f"{marker} {icon} {ent['name']}", attr)
+                    show_size = bool(PREFS.get("show_size"))
+                    show_mtime = bool(PREFS.get("show_mtime"))
+                    show_perm = bool(PREFS.get("show_perm"))
+                    disp_name = ent["name"]
+                    if (PREFS.get("hide_ext") and not ent.get("is_dir")
+                            and not ent.get("is_parent_link")
+                            and "." in disp_name[1:] and not disp_name.endswith(".")):
+                        stem, ext = disp_name.rsplit(".", 1)
+                        if stem and ext:
+                            disp_name = stem
+                    head = f"{marker} {icon} {disp_name}"
+                    col_total = ((10 if show_size else 0)
+                                 + (13 if show_mtime else 0)
+                                 + (6 if show_perm else 0))
+                    if col_total and not ent.get("is_parent_link"):
+                        put(2 + di, 0, clip(head, max(6, w - 1 - col_total)), attr)
+                        cx = w - 1 - col_total
+                        if show_size:
+                            put(2 + di, cx,
+                                human_size(ent.get("size") or 0).rjust(8), attr)
+                            cx += 10
+                        if show_mtime:
+                            put(2 + di, cx, time.strftime(
+                                "%m-%d %H:%M",
+                                time.localtime(ent.get("mtime") or 0)).rjust(11), attr)
+                            cx += 13
+                        if show_perm:
+                            put(2 + di, cx,
+                                perm_short(ent.get("mode"),
+                                           bool(ent.get("is_dir"))).rjust(5), attr)
+                    else:
+                        put(2 + di, 0, head, attr, maxcols=w - 1)
 
                 sy = btn_row - 1
                 if search_mode:
                     put(sy, 0, f"/{search_keyword}", curses.A_REVERSE)
                 else:
-                    left = f"Sel:{len(selected_set)} | Matches:{len(search_matches)}"
+                    left = f"Sel:{len(selected_set)} | ?:键位"
                     if status_msg:
                         put(sy, 0, f"⚠ {status_msg}  |  {left}",
                             curses.A_BOLD | curses.A_REVERSE)
                     else:
-                        put(sy, 0, f"↑↓滚动 | 点击勾选 | {left}")
+                        put(sy, 0, f"↑↓移动 SPACE勾选 ENTER进目录 BS粉碎 ^C/^X/^V ^F搜索 ALT+←/→ {left}")
 
                 for rb in rendered_buttons:
                     if rb["x1"] >= w:
                         break
                     put(btn_row, rb["x1"], rb["name"], curses.A_BOLD | curses.A_REVERSE,
                         maxcols=w - rb["x1"] - 1)
+
+                # ---- 底部标签页栏 ----
+                tab_row = btn_row - 2
+                tab_boxes = []
+                tx = 0
+                for ti in range(len(tabs)):
+                    title = tab_title(ti)
+                    colored = tab_color(ti)
+                    label = (f" {ti + 1} {clip(title, 14)}" +
+                             (f" ●{TAB_COLOR_NAMES[colored][0]} " if colored else " "))
+                    wl = text_width(label)
+                    if tx + wl + 3 >= w:
+                        label = f" {ti + 1} "
+                        wl = text_width(label)
+                    put(tab_row, tx, label, tab_attr(ti, ti == tab_idx))
+                    tab_boxes.append((tx, tx + wl - 1, ti, "switch"))
+                    tx += wl
+                    if len(tabs) > 1:
+                        put(tab_row, tx, "×", curses.A_BOLD)
+                        tab_boxes.append((tx, tx, ti, "close"))
+                        tx += 1
+                    tx += 1
+                put(tab_row, tx, " [+] ", curses.A_BOLD)
+
+                # ---- 菜单下拉 ----
+                if mode == MODE_MENU:
+                    items = MENUS[menu_idx][1]
+                    lbl_w = max(text_width(lbl) for (lbl, _hk, _a) in items)
+                    hk_w = max(len(hk) for (_lbl, hk, _a) in items)
+                    # 框宽（列）：左右边框各 1 + 内边距 1 + 文字区 + 空隙 2 + 快捷键区 + 内边距 1
+                    inner = lbl_w + hk_w + 4
+                    box_w = inner + 2
+                    bx0 = min(menu_x[menu_idx], max(0, w - box_w - 1))
+                    vis = max(1, min(len(items), tab_row - 3))
+                    off = 0
+                    if menu_sel >= vis:
+                        off = menu_sel - vis + 1
+                    put(2, bx0, "┌" + "─" * inner + "┐", curses.A_BOLD)
+                    for k, (lbl, hk, _a) in enumerate(items[off:off + vis]):
+                        row = 3 + k
+                        attr = curses.A_REVERSE if (off + k) == menu_sel else curses.A_NORMAL
+                        pad = lbl_w - text_width(lbl) + 2
+                        text = lbl + " " * max(1, pad) + hk.rjust(hk_w)
+                        pad_r = max(0, inner - 2 - text_width(text))
+                        line = "│ " + text + " " * pad_r + " │"
+                        put(row, bx0, line, attr)
+                    put(3 + vis, bx0, "└" + "─" * inner + "┘", curses.A_BOLD)
 
             elif mode == MODE_PREVIEW:
                 put(0, 0, "📋 Preview selected items (Folders will RECURSIVELY shred)", curses.A_BOLD)
@@ -752,7 +2781,9 @@ def tui_main(stdscr):
                 put(btn_row, 0, "[Quit]  [Back]", curses.A_BOLD | curses.A_REVERSE)
 
             elif mode == MODE_CONFIRM1:
-                msg = "⚠️ FIRST CONFIRM: You are going to shred selected items!"
+                n_sel = len([e for e in all_selected_entries
+                             if not e.get("is_parent_link")])
+                msg = f"⚠ FIRST CONFIRM: {n_sel} item(s) will be shredded!"
                 warn = "Folders will recursively overwrite ALL inner files!"
                 prompt = "Press ENTER to continue to SECOND confirmation, ESC cancel"
                 put(h // 2 - 2, max(0, w // 2 - len(msg) // 2), msg, curses.A_BOLD | curses.A_REVERSE)
@@ -792,17 +2823,146 @@ def tui_main(stdscr):
                 put(5, split_x, f"Current File: {current_file_pct}%")
                 put(6, split_x, f"Status: {current_file_status}")
 
+            elif mode == MODE_FIND:
+                put(0, 0, "🔎 Search in this folder (all-round)", curses.A_BOLD)
+                put(1, 0, "-" * (w - 1))
+                put(2, 0, f"PWD: {current_pwd}", curses.A_DIM, maxcols=w - 1)
+                scope = FIND_SCOPES[max(0, min(len(FIND_SCOPES) - 1,
+                                              find_scope_idx))]
+                opts = "  ".join(("[ " + sc + " ]") if sc == scope else sc
+                                 for sc in FIND_SCOPES)
+                put(4, 0, f"范围: {opts}", curses.A_BOLD)
+                put(5, 0, "name contains:", curses.A_BOLD)
+                put_input(6, 0, "  ", find_query, find_cur)
+                if find_note:
+                    put(8, 0, find_note, curses.A_BOLD | curses.A_REVERSE)
+                else:
+                    put(8, 0, "输入关键词后 ENTER 开始搜索（最多 800 条，涵盖隐藏项与子目录）",
+                        curses.A_DIM)
+                put(btn_row - 1, 0,
+                    "TAB/←→ 换范围 | ENTER 搜索 | ESC 取消 | 支持 * ? 通配")
+                put_input(btn_row, 0, "/", find_query, find_cur)
+
+            elif mode == MODE_FIND_RES:
+                put(0, 0, f"🔎 {find_note}", curses.A_BOLD)
+                put(1, 0, f"PWD: {current_pwd}", curses.A_DIM)
+                max_lines = max(1, btn_row - 4)
+                off = find_window(max_lines)
+                if not find_hits:
+                    put(3, 0, "没有命中。BACKSPACE 回输入框改关键词，或换更短的词。",
+                        curses.A_REVERSE)
+                for di in range(max_lines):
+                    ri = off + di
+                    if ri >= len(find_hits):
+                        break
+                    hit = find_hits[ri]
+                    try:
+                        rel = os.path.relpath(hit["path"], current_pwd)
+                    except ValueError:
+                        rel = hit["path"]
+                    icon = "📁" if hit["is_dir"] else "📄"
+                    mark = ">" if ri == find_sel else " "
+                    attr = curses.A_REVERSE if ri == find_sel else curses.A_NORMAL
+                    put(3 + di, 0, f"{mark} {icon} {rel}", attr)
+                put(btn_row - 1, 0,
+                    "↑↓ 选择 | ENTER 跳到该位置 | BACKSPACE 改关键词 | ESC 返回")
+                put(btn_row, 0, f"[{find_sel + 1 if find_hits else 0}/{len(find_hits)}]",
+                    curses.A_BOLD | curses.A_REVERSE)
+
+            elif mode == MODE_PROPS:
+                put(0, 0, f"🛈 Properties: {prop_title}", curses.A_BOLD)
+                put(0, max(0, w - len(VERSION) - 2), VERSION, curses.A_DIM)
+                put(1, 0, "-" * (w - 1))
+                max_lines = max(1, btn_row - 4)
+                visible = prop_text[prop_off:prop_off + max_lines]
+                y = 3
+                for line in visible:
+                    put(y, 0, line, maxcols=w - 1)
+                    y += 1
+                hint_edit = " | I 编辑属性" if prop_path else " | I 编辑(需单选)"
+                if prop_msg:
+                    put(btn_row - 2, 0, prop_msg, curses.A_REVERSE, maxcols=w - 1)
+                if len(prop_text) > max_lines:
+                    put(btn_row - 1, 0,
+                        f"↑↓/PGUP/PGDN 滚动 [{prop_off + 1}-{prop_off + len(visible)}/{len(prop_text)}]"
+                        f"{hint_edit} | ESC/ENTER 关闭")
+                else:
+                    put(btn_row - 1, 0, f"ESC / ENTER 关闭{hint_edit}")
+
+            elif mode == MODE_PROPS_EDIT:
+                put(0, 0, f"✎ Edit properties: {prop_title}", curses.A_BOLD)
+                put(1, 0, "-" * (w - 1))
+                put(2, 0, f"path: {prop_path}", curses.A_DIM)
+                y = 4
+                for i, (fkey, flabel) in enumerate(PROP_FIELDS):
+                    val = prop_field_value(fkey)
+                    attr = curses.A_REVERSE if i == prop_edit_idx else curses.A_NORMAL
+                    put(y + i, 0, f" {'>' if i == prop_edit_idx else ' '} {flabel:<12} "
+                                  f"{val}", attr, maxcols=w - 1)
+                put(4 + len(PROP_FIELDS) + 1, 0,
+                    "名称 = 改名；权限 = 八进制如 644；时间 = 2026-11-27 15:30:00 / +3 / now",
+                    curses.A_DIM)
+                if prop_msg:
+                    put(btn_row - 1, 0, prop_msg, curses.A_REVERSE)
+                else:
+                    put(btn_row - 1, 0, "↑↓ 选择字段 | ENTER 修改 | ESC 返回属性页")
+
+            elif mode == MODE_PROPS_ENTRY:
+                fkey, flabel = PROP_FIELDS[prop_edit_idx]
+                put(0, 0, f"✎ {flabel}: {prop_title}", curses.A_BOLD)
+                put(1, 0, "-" * (w - 1))
+                put(3, 0, f"当前: {prop_field_value(fkey)}", curses.A_DIM)
+                put(5, 0, "新值:", curses.A_BOLD)
+                put_input(6, 0, "  ", prop_edit_buf, prop_cur)
+                put(8, 0, prop_msg or "ENTER 保存 | ESC 放弃")
+                put_input(btn_row, 0, ">", prop_edit_buf, prop_cur)
+
+            elif mode == MODE_HELP:
+                put(0, 0, "⌨ Key map", curses.A_BOLD)
+                put(1, 0, "-" * (w - 1))
+                max_lines = max(1, btn_row - 4)
+                y = 2
+                for k, desc in KEY_HELP[:max_lines]:
+                    put(y, 0, f"  {k:<16} {desc}", maxcols=w - 1)
+                    y += 1
+                put(btn_row - 1, 0, "ESC / ENTER / q 关闭")
+
+            elif mode == MODE_PICK:
+                put(0, 0, f"📂 {pick_title}", curses.A_BOLD)
+                put(1, 0, f"cmd: {cmd_buffer}")
+                render_pick(pick_title, pick_items, pick_sel,
+                            "↑↓选择 · ENTER确认 · ESC取消 · 也可直接点")
+                put_input(btn_row, 0, ":", cmd_buffer, cmd_cur)
+
             elif mode == MODE_CMDLINE:
                 hint = f"↑↓ 历史({len(hist_list)})"
                 if hist_list and cmd_hist_idx < len(hist_list):
                     hint += f" [{cmd_hist_idx + 1}/{len(hist_list)}]"
-                put(0, 0, f"📂 Command mode | ESC cancel | {hint} | cmd: {cmd_buffer}", curses.A_BOLD)
+                if cmd_search_mode:
+                    qshow = cmd_search_q if cmd_search_q else "…"
+                    head = (f"🔎 搜索「{qshow}」命中 {len(cmd_search_matches)} 条"
+                            f" | cmd: {cmd_buffer}")
+                else:
+                    head = (f"📂 Command mode | ESC cancel | {hint} "
+                            f"| cmd: {cmd_buffer}  | ^R 搜历史 · Tab 补全")
+                put(0, 0, head, curses.A_BOLD)
                 if cmd_error:
-                    put(1, 0, f"⚠️ {cmd_error}", curses.A_REVERSE)
+                    put(1, 0, f"⚠ {cmd_error}", curses.A_REVERSE)
+                elif cmd_note:
+                    put(1, 0, cmd_note)
 
                 # 历史浏览：显示当前光标附近若干条，当前项高亮
-                y = 3 if cmd_error else 2
+                y = 3 if (cmd_error or cmd_note) else 2
                 max_lines = btn_row - y - 1
+                if cmd_search_mode:
+                    if cmd_search_matches:
+                        items = [(hist_list[i], hist_list[i]) for i in cmd_search_matches]
+                        render_pick("历史反向搜索", items, cmd_search_sel,
+                                    "↑↓选择 · ENTER确认 · ESC退出搜索")
+                    else:
+                        put(3, 0, f"没有匹配 `{cmd_search_q}` 的历史记录，继续输入或 ESC 退出",
+                            curses.A_REVERSE)
+                    max_lines = 0
                 if hist_list and max_lines > 0:
                     start = max(0, cmd_hist_idx - 3)
                     end = min(len(hist_list), start + max_lines)
@@ -816,8 +2976,216 @@ def tui_main(stdscr):
                         put(y, 0, f"{prefix} {hi + 1}: {hist_list[hi]}", attr)
                         y += 1
 
-                put(btn_row, 0, f":{cmd_buffer}", curses.A_REVERSE)
+                put_input(btn_row, 0, ":", cmd_buffer, cmd_cur)
                 put(btn_row - 1, 0, f"history file: {HISTORY_FILE}")
+
+            elif mode == MODE_ABOUT:
+                put(0, 0, f"ℹ  About FileShredder {VERSION}", curses.A_BOLD)
+                put(1, 0, "=" * (w - 1))
+                eng = "system shred (coreutils)" if USE_SYSTEM_SHRED else "built-in python"
+                rows = [
+                    ("Version", f"{VERSION} (Termux TUI)"),
+                    ("Python", sys.version.split()[0]),
+                    ("Platform", sys.platform),
+                    ("Engine", f"{eng}, passes={PREFS['passes']}"),
+                    ("History", f"{len(hist_list)} entries"),
+                    ("HistoryFile", HISTORY_FILE),
+                    ("PrefsFile", PREFS_FILE),
+                    ("DefaultDir", PREFS["default_dir"]),
+                    ("StartMode", f"{PREFS['start_mode']} ({START_MODE_LABELS.get(PREFS['start_mode'], '?')})"),
+                    ("LastDir", PREFS.get("last_dir") or "(未记录)"),
+                    ("CurrentDir", current_pwd),
+                    ("Selected", f"{len(selected_set)} items"),
+                    ("Keys", "↑↓ move/scroll · SPACE select · ENTER preview"),
+                    ("", ":about:preferences 设置 · :about:about 本页 · q 退出"),
+                ]
+                y = 3
+                for k, v in rows:
+                    if y >= btn_row - 1:
+                        break
+                    if k:
+                        put(y, 0, f"{k:<12}: {v}", maxcols=w - 1)
+                    else:
+                        put(y, 0, f"   {v}", maxcols=w - 1)
+                    y += 1
+                put(btn_row - 1, 0, "ESC / ENTER / q  →  back to list")
+                put(btn_row, 0, "[Back]", curses.A_BOLD | curses.A_REVERSE)
+
+            elif mode in (MODE_CONFIG, MODE_CONFIG_EDIT):
+                put(0, 0, "⚙  about:config   ESC=back  ↑↓=move  ENTER=改值  R=从磁盘重载  s=保存  r=默认",
+                    curses.A_BOLD)
+                put(1, 0, "=" * (w - 1))
+                y = 3
+                for i, (key, kind, desc) in enumerate(CONFIG_KEYS):
+                    attr = curses.A_REVERSE if i == cfg_cursor else curses.A_NORMAL
+                    cur = ">" if i == cfg_cursor else " "
+                    val = config_value_to_text(key, kind)
+                    put(y, 0, f"{cur} {key:<18} = {val}   ({kind})", attr, maxcols=w - 2)
+                    y += 1
+                y += 1
+                if y < btn_row - 2:
+                    desc = CONFIG_KEYS[cfg_cursor][2]
+                    put(y, 0, f"说明: {desc}", maxcols=w - 1)
+                    y += 1
+                try:
+                    st = os.stat(PREFS_FILE)
+                    fdesc = f"{PREFS_FILE}  {st.st_size} bytes  mtime={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(st.st_mtime))}"
+                except OSError:
+                    fdesc = f"{PREFS_FILE}  (文件不存在，s 键生成)"
+                if y < btn_row - 2:
+                    put(y, 0, f"config file: {fdesc}", maxcols=w - 1)
+                if mode == MODE_CONFIG_EDIT:
+                    put_input(btn_row - 1, 0, f"{CONFIG_KEYS[cfg_cursor][0]} = ",
+                              cfg_edit_buffer, cfg_edit_cur,
+                              "   ENTER 确认 / ESC 取消", curses.A_BOLD)
+                elif cfg_note:
+                    put(btn_row - 1, 0, f"⚠ {cfg_note}", curses.A_REVERSE, maxcols=w - 1)
+                else:
+                    put(btn_row - 1, 0, "R = 丢弃内存值并重新从磁盘加载（改 JSON 后按它）",
+                        curses.A_BOLD | curses.A_REVERSE)
+                put(btn_row, 0, "[Back]  [Reload]", curses.A_BOLD | curses.A_REVERSE)
+
+            elif mode in (MODE_PREFS, MODE_PREFS_EDIT):
+                put(0, 0, "⚙  about:preferences   ESC=back  ↑↓=move  ←→/+-=change  SPACE=toggle",
+                    curses.A_BOLD)
+                put(1, 0, "=" * (w - 1))
+                englabel = "system shred" if USE_SYSTEM_SHRED else "built-in python"
+                labels = [
+                    ("Shred passes", f"{PREFS['passes']}      < ←/→ 与 + - 调整 1-9 >"),
+                    ("Engine", f"{englabel}      < SPACE / ENTER 切换 >"),
+                    ("Start path", f"{START_MODE_LABELS[PREFS['start_mode']]}      "
+                                   "< ←/→ / ENTER 循环 4 种 >"),
+                    ("Default start dir", f"{PREFS['default_dir']}      < ENTER 修改 >"),
+                    ("Last used dir", f"{PREFS.get('last_dir') or '(尚未记录)'}      "
+                                      "< ENTER 记为当前目录 >"),
+                    ("Clear shell history", f"{len(hist_list)} 条      < ENTER 清空 >"),
+                    ("Reset to defaults", "< r >"),
+                    ("Back to list", "< ESC >"),
+                ]
+                y = 3
+                for i, (lab, val) in enumerate(labels):
+                    attr = curses.A_REVERSE if i == prefs_cursor else curses.A_NORMAL
+                    cur = ">" if i == prefs_cursor else " "
+                    put(y, 0, f"{cur} {lab:<18}: {val}", attr, maxcols=w - 2)
+                    y += 1
+                y += 1
+                if y < btn_row - 2:
+                    put(y, 0, f"本次启动来源 : {seed_src} → {current_pwd}", maxcols=w - 1)
+                    y += 1
+                if y < btn_row - 2:
+                    put(y, 0, f"history file : {HISTORY_FILE}", maxcols=w - 1)
+                    y += 1
+                if y < btn_row - 2:
+                    put(y, 0, f"prefs   file : {PREFS_FILE}", maxcols=w - 1)
+                    y += 1
+                if y < btn_row - 2:
+                    put(y, 0, "改动即时原子写入 JSON，下次启动自动生效", maxcols=w - 1)
+                note_row = btn_row - 1
+                if mode == MODE_PREFS_EDIT:
+                    put_input(note_row, 0, "新的默认起始目录: ",
+                              prefs_edit_buffer, prefs_edit_cur,
+                              "   ENTER 确认 / ESC 取消", curses.A_BOLD)
+                elif settings_note:
+                    put(note_row, 0, f"⚠ {settings_note}", curses.A_REVERSE, maxcols=w - 1)
+                else:
+                    put(note_row, 0, "自动保存 · R=从磁盘重载 · r=恢复默认 · ESC 返回",
+                        curses.A_BOLD | curses.A_REVERSE)
+                put(btn_row, 0, "[Back]  [Reset]", curses.A_BOLD | curses.A_REVERSE)
+
+            elif mode == MODE_OPENWITH:
+                put(0, 0, f"📂  Open with   {VERSION}", curses.A_BOLD)
+                put(1, 0, "-" * (w - 1))
+                if len(ow_targets) > 1:
+                    put(2, 0, f"目标: {len(ow_targets)} 项 → "
+                              f"{os.path.basename(ow_targets[0].rstrip('/'))} 等",
+                        curses.A_DIM, maxcols=w - 1)
+                else:
+                    put(2, 0, f"目标: {ow_path}", curses.A_DIM, maxcols=w - 1)
+                put(3, 0, f"可用程序 {len(ow_items)} 个（只列出本机已安装的）",
+                    curses.A_DIM, maxcols=w - 1)
+                for i, item in enumerate(ow_items):
+                    lab, argv = item[0], item[1]
+                    attr = curses.A_REVERSE if i == ow_sel else curses.A_NORMAL
+                    cur = ">" if i == ow_sel else " "
+                    tail = "" if argv else ""
+                    put(5 + i, 0, f"{cur} {lab}{tail}", attr, maxcols=w - 2)
+                if ow_note:
+                    put(btn_row - 1, 0, f"选中: {ow_note}", curses.A_DIM, maxcols=w - 1)
+                put(btn_row, 0, "[Run]", curses.A_BOLD | curses.A_REVERSE)
+                put(btn_row, 7, "  [Cancel]", curses.A_BOLD)
+
+            elif mode == MODE_OPENSEARCH:
+                put(0, 0, f"🔍  其他打开方式 · 搜索本机程序   {VERSION}",
+                    curses.A_BOLD)
+                put(1, 0, "-" * (w - 1))
+                if len(ow_targets) > 1:
+                    put(2, 0, f"目标: {len(ow_targets)} 项（批量打开）",
+                        curses.A_DIM, maxcols=w - 1)
+                else:
+                    put(2, 0, f"目标: {ow_path}", curses.A_DIM, maxcols=w - 1)
+                progs = filtered_programs()
+                put(3, 0, f"筛选程序（共 {len(system_programs())} 个，"
+                          f"命中 {len(progs)} 个）:", curses.A_BOLD)
+                put_input(4, 0, "  ", ow_filter, ow_cur)
+                max_rows = max(1, btn_row - 6)
+                if ow_prog_sel > len(progs) - 1:
+                    ow_prog_sel = max(0, len(progs) - 1)
+                off = max(0, ow_prog_sel - max_rows + 1)
+                if not progs:
+                    put(6, 0, "没有匹配的程序。例如 Ardour / Audacity / Audacious "
+                              "需要先装（pkg install …）", curses.A_REVERSE)
+                for di in range(max_rows):
+                    ri = off + di
+                    if ri >= len(progs):
+                        break
+                    nm, full = progs[ri]
+                    attr = (curses.A_REVERSE if ri == ow_prog_sel
+                            else curses.A_NORMAL)
+                    cur = ">" if ri == ow_prog_sel else " "
+                    put(6 + di, 0, f"{cur} {nm}  {full}", attr, maxcols=w - 2)
+                put(btn_row, 0, "[Run]  [Back]", curses.A_BOLD | curses.A_REVERSE)
+
+            elif mode == MODE_TABNAME:
+                put(0, 0, f"✎  Rename tab {tab_idx + 1}   {VERSION}", curses.A_BOLD)
+                put(1, 0, "-" * (w - 1))
+                put(2, 0, f"PWD: {current_pwd}", curses.A_DIM, maxcols=w - 1)
+                put(4, 0, "标签名（留空则跟随目录名）:", curses.A_BOLD)
+                put_input(5, 0, "  ", tab_name_buf, tab_name_cur)
+                put(6, 0, f"色彩标记: {TAB_COLOR_NAMES[tab_color(tab_idx)]}"
+                          f"   （Alt+C 切换 / 菜单 Window → 标签颜色）",
+                    curses.A_DIM)
+                put(btn_row - 1, 0,
+                    "ENTER 保存 | ESC 取消 | ←→ HOME END BACKSPACE DELETE 编辑")
+                put(btn_row, 0, "[Save]  [Cancel]", curses.A_BOLD | curses.A_REVERSE)
+
+            elif mode == MODE_FOLDOPTS:
+                put(0, 0, f"⚙  Folder display options   {VERSION}", curses.A_BOLD)
+                put(1, 0, "-" * (w - 1))
+                put(2, 0, f"PWD: {current_pwd}", curses.A_DIM, maxcols=w - 1)
+                lab_w = max(text_width(lab) for (_k, lab, _t) in FOLDOPTS)
+                val_w = max(text_width(foldopt_value_text(k, t))
+                            for (k, _l, t) in FOLDOPTS)
+                y = 4
+                for i, (key, lab, kind) in enumerate(FOLDOPTS):
+                    attr = curses.A_REVERSE if i == foldopts_idx else curses.A_NORMAL
+                    cur = ">" if i == foldopts_idx else " "
+                    val = foldopt_value_text(key, kind)
+                    pad = lab_w - text_width(lab) + 2
+                    put(y, 0, f"{cur} {lab}{' ' * pad}{val.rjust(val_w)}", attr,
+                        maxcols=w - 2)
+                    y += 1
+                attr = curses.A_REVERSE if foldopts_idx == len(FOLDOPTS) else curses.A_NORMAL
+                put(y, 0, f"{'>' if foldopts_idx == len(FOLDOPTS) else ' '} 恢复默认显示选项",
+                    attr)
+                y += 2
+                put(y, 0, "这些是“怎么看”，不是“怎么改”：只影响列表里的显示与排序",
+                    curses.A_DIM, maxcols=w - 1)
+                if foldopts_note:
+                    put(btn_row - 1, 0, foldopts_note, curses.A_REVERSE, maxcols=w - 1)
+                else:
+                    put(btn_row - 1, 0,
+                        "↑↓ 选择 | ENTER/SPACE 切换 | ←→ 切换排序 | r 恢复默认 | ESC 返回")
+                put(btn_row, 0, "[Back]  [Reset]", curses.A_BOLD | curses.A_REVERSE)
 
             stdscr.refresh()
             dirty = False
@@ -840,7 +3208,7 @@ def tui_main(stdscr):
                 continue
             if current_file_generator is None:
                 current_file_generator = shred_single_file(
-                    total_file_list[current_global_idx], passes=SHRED_PASSES)
+                    total_file_list[current_global_idx], passes=PREFS["passes"])
             try:
                 current_file_pct, current_file_status = next(current_file_generator)
                 dirty = True
@@ -861,14 +3229,287 @@ def tui_main(stdscr):
             _, btn, mx, my, pressed = key
             mx -= 1
             my -= 1
+            # 一次点击 = 按下 + 抬起两个事件。动作只认按下，否则会"点一下算两下"
+            # （复选框被切两次等于没切、菜单开两次、按钮连点两次）。
+            # 滚轮（64..67，含 Shift 滚轮 68..71）没有单独的抬起，照旧处理。
+            if not pressed:   # 抬手事件（含滚轮的 "m"）一律丢掉
+                continue
+
+            # ---- 选择菜单（补全候选 / 历史匹配）：滚轮移动，点击即确认 ----
+            if mode == MODE_PICK or (mode == MODE_CMDLINE and cmd_search_mode):
+                is_pick = (mode == MODE_PICK)
+                items = pick_items if is_pick else \
+                    [(hist_list[i], hist_list[i]) for i in cmd_search_matches]
+                title = pick_title if is_pick else "历史反向搜索"
+                sel = pick_sel if is_pick else cmd_search_sel
+                top, left, boxw, shown, off = pick_geo(title, items, sel)
+                if btn in (64, 65):
+                    if items:
+                        step = -1 if btn == 64 else 1
+                        newsel = max(0, min(len(items) - 1, sel + step))
+                        if is_pick:
+                            pick_sel = newsel
+                        else:
+                            cmd_search_sel = newsel
+                            cmd_search_pos = cmd_search_matches[newsel]
+                            cmd_buffer = hist_list[cmd_search_pos]
+                            cmd_cur = len(cmd_buffer)
+                    dirty = True
+                    continue
+                if btn & 3 == 0:
+                    idx = my - (top + 3) + off
+                    if 0 <= idx < len(items) and left <= mx <= left + boxw - 1:
+                        if is_pick:
+                            pick_sel = idx
+                            label, val = pick_items[idx]
+                            if pick_ctx == "complete":
+                                cmd_buffer = pick_prefix + val
+                                cmd_cur = len(cmd_buffer)
+                                cmd_note = f"已选: {label}"
+                            pick_items = []
+                            mode = MODE_CMDLINE
+                        else:
+                            cmd_search_sel = idx
+                            cmd_search_pos = cmd_search_matches[idx]
+                            cmd_buffer = hist_list[cmd_search_pos]
+                            cmd_cur = len(cmd_buffer)
+                            cmd_hist_idx = cmd_search_pos
+                            cmd_search_mode = False
+                            cmd_note = "已选历史命令，可编辑后再 ENTER 执行"
+                        dirty = True
+                    continue
 
             if btn == 64:
-                cursor_idx = max(0, cursor_idx - 1)
-                _scroll_to(cursor_idx)
+                if mode == MODE_CMDLINE and hist_list:
+                    # 命令行里滚轮也当历史翻页
+                    if cmd_hist_idx >= len(hist_list):
+                        cmd_draft = cmd_buffer
+                    if cmd_hist_idx > 0:
+                        cmd_hist_idx -= 1
+                        cmd_buffer = hist_list[cmd_hist_idx]
+                        cmd_cur = len(cmd_buffer)
+                    dirty = True
+                else:
+                    cursor_idx = max(0, cursor_idx - 1)
+                    _scroll_to(cursor_idx)
                 continue
             if btn == 65:
-                cursor_idx = min(len(scan_entries) - 1, cursor_idx + 1)
-                _scroll_to(cursor_idx)
+                if mode == MODE_CMDLINE and hist_list:
+                    if cmd_hist_idx < len(hist_list) - 1:
+                        cmd_hist_idx += 1
+                        cmd_buffer = hist_list[cmd_hist_idx]
+                        cmd_cur = len(cmd_buffer)
+                    elif cmd_hist_idx >= len(hist_list) - 1:
+                        cmd_hist_idx = len(hist_list)
+                        cmd_buffer = cmd_draft
+                        cmd_cur = len(cmd_buffer)
+                    dirty = True
+                else:
+                    cursor_idx = min(len(scan_entries) - 1, cursor_idx + 1)
+                    _scroll_to(cursor_idx)
+                continue
+
+            if mode == MODE_FIND_RES:
+                h, _ = stdscr.getmaxyx()
+                max_lines = max(1, (h - 1) - 4)
+                off = find_window(max_lines)
+                if btn in (64, 65):
+                    step = -1 if btn == 64 else 1
+                    if find_hits:
+                        find_sel = max(0, min(len(find_hits) - 1, find_sel + step))
+                    dirty = True
+                    continue
+                if btn & 3 == 0:
+                    ri = off + (my - 3)
+                    if 0 <= ri < len(find_hits):
+                        find_sel = ri
+                        goto_find_hit(find_hits[ri])
+                    dirty = True
+                    continue
+
+            if mode == MODE_PROPS_EDIT:
+                if btn in (64, 65):
+                    step = 1 if btn == 65 else -1
+                    prop_edit_idx = max(0, min(len(PROP_FIELDS) - 1, prop_edit_idx + step))
+                    dirty = True
+                    continue
+                if btn & 3 == 0:
+                    row = my - 4
+                    if 0 <= row < len(PROP_FIELDS):
+                        prop_edit_idx = row
+                        dirty = True
+                    else:
+                        mode = MODE_PROPS
+                        prop_msg = ""
+                        refresh_props()
+                        dirty = True
+                    continue
+
+            if mode in (MODE_PROPS, MODE_HELP):
+                h, _ = stdscr.getmaxyx()
+                max_lines = max(1, (h - 1) - 4)
+                if mode == MODE_PROPS and btn in (64, 65) and len(prop_text) > max_lines:
+                    step = 1 if btn == 65 else -1
+                    prop_off = max(0, min(max(0, len(prop_text) - 1), prop_off + step))
+                    dirty = True
+                    continue
+                if btn & 3 == 0:
+                    if mode == MODE_PROPS:
+                        mode = MODE_LIST
+                        prop_off = 0
+                    else:
+                        mode = MODE_LIST
+                    dirty = True
+                    continue
+
+            if mode == MODE_FIND:
+                if btn & 3 == 0:
+                    mode = MODE_LIST
+                    find_query = ""
+                    find_cur = len(find_query)
+                    find_note = ""
+                    dirty = True
+                continue
+
+            if mode == MODE_ABOUT:
+                h, _ = stdscr.getmaxyx()
+                if my >= h - 2:
+                    mode = MODE_LIST
+                    dirty = True
+                continue
+
+            if mode == MODE_OPENSEARCH:
+                h, w = stdscr.getmaxyx()
+                progs = filtered_programs()
+                max_rows = max(1, (h - 1) - 6)
+                off = max(0, ow_prog_sel - max_rows + 1)
+                if my == h - 1:
+                    if mx < w // 2:
+                        run_searched_program()
+                    else:
+                        mode = MODE_OPENWITH
+                    dirty = True
+                elif my >= 6:
+                    ri = off + (my - 6)
+                    if 0 <= ri < len(progs):
+                        ow_prog_sel = ri
+                        run_searched_program()
+                    dirty = True
+                continue
+
+            if mode == MODE_OPENWITH:
+                h, w = stdscr.getmaxyx()
+                if my == h - 1:
+                    if mx < w // 2:
+                        run_open_with()
+                    else:
+                        mode = MODE_LIST
+                        set_status("已取消打开方式")
+                    dirty = True
+                elif my >= 5:
+                    idx = my - 5
+                    if 0 <= idx < len(ow_items):
+                        ow_sel = idx
+                        run_open_with(idx)
+                    dirty = True
+                continue
+
+            if mode == MODE_TABNAME:
+                h, w = stdscr.getmaxyx()
+                if my == h - 1:
+                    if mx < w // 2:
+                        apply_tab_rename()
+                    else:
+                        mode = MODE_LIST
+                        set_status("已取消重命名")
+                    dirty = True
+                continue
+
+            if mode == MODE_FOLDOPTS:
+                h, w = stdscr.getmaxyx()
+                if my == h - 1:
+                    if mx < w // 2:
+                        mode = MODE_LIST
+                        save_prefs()
+                    else:
+                        foldopts_reset()
+                    dirty = True
+                else:
+                    idx = my - 4
+                    if 0 <= idx < len(FOLDOPTS):
+                        foldopts_idx = idx
+                        key_name, _lab, kind = FOLDOPTS[idx]
+                        foldopt_toggle(key_name, kind, 1)
+                    elif idx == len(FOLDOPTS):
+                        foldopts_reset()
+                    dirty = True
+                continue
+
+            if mode in (MODE_CONFIG, MODE_CONFIG_EDIT):
+                h, w = stdscr.getmaxyx()
+                if my == h - 1:
+                    if mx < w // 2:
+                        mode = MODE_LIST
+                        cfg_note = ""
+                    else:
+                        reload_prefs_from_disk()
+                        cfg_note = "已从磁盘重载"
+                    dirty = True
+                elif 3 <= my <= 3 + len(CONFIG_KEYS) - 1 and mode == MODE_CONFIG:
+                    cfg_cursor = max(0, min(len(CONFIG_KEYS) - 1, my - 3))
+                    cfg_note = ""
+                    dirty = True
+                continue
+
+            if mode in (MODE_PREFS, MODE_PREFS_EDIT):
+                h, w = stdscr.getmaxyx()
+                if my == h - 1:
+                    if mx < w // 2:
+                        mode = MODE_LIST
+                        status_msg = ""
+                    else:
+                        PREFS.update(dict(DEFAULT_PREFS))
+                        USE_SYSTEM_SHRED = PREFS["use_system_shred"]
+                        save_prefs()
+                        settings_note = "已恢复默认设置"
+                    dirty = True
+                elif 3 <= my <= 9 and mode == MODE_PREFS:
+                    prefs_cursor = max(0, min(7, my - 3))
+                    settings_note = ""
+                    dirty = True
+                continue
+
+            if mode == MODE_MENU:
+                h, w = stdscr.getmaxyx()
+                btn_row_guess = h - 1
+                boxes = menu_hit_boxes()
+                if my == 0:
+                    hit = None
+                    for i, (x1, x2, _t) in enumerate(boxes):
+                        if x1 <= mx <= x2:
+                            hit = i
+                            break
+                    if hit is None:
+                        mode = MODE_LIST
+                    else:
+                        menu_idx = hit
+                        menu_sel = 0
+                    dirty = True
+                    continue
+                items = MENUS[menu_idx][1]
+                lbl_w = max(text_width(lbl) for (lbl, _hk, _a) in items)
+                hk_w = max(len(hk) for (_lbl, hk, _a) in items)
+                box_w = lbl_w + hk_w + 6
+                bx0 = min(boxes[menu_idx][0], max(0, w - box_w - 1))
+                if 3 <= my <= 3 + min(len(items), btn_row_guess - 4) - 1 and mx >= bx0:
+                    act = items[my - 3][2]
+                    if act == "quit":
+                        return
+                    mode = MODE_LIST
+                    menu_action(act)
+                    continue
+                mode = MODE_LIST
+                dirty = True
                 continue
 
             if mode == MODE_LIST:
@@ -882,6 +3523,37 @@ def tui_main(stdscr):
                     rendered_buttons.append({"name": bname, "action": action,
                                              "x1": bx, "x2": bx + b_len - 1})
                     bx += b_len + gap
+
+                if my == 0:
+                    hit = None
+                    for i, (x1, x2, _t) in enumerate(menu_hit_boxes()):
+                        if x1 <= mx <= x2:
+                            hit = i
+                            break
+                    if hit is not None:
+                        open_menu(hit)
+                    continue
+
+                if my == btn_row - 2:
+                    if not pressed:      # 只认按下，避免抬手事件重复触发
+                        continue
+                    hit_tab = None
+                    for (x1, x2, ti, kind) in tab_boxes:
+                        if x1 <= mx <= x2:
+                            hit_tab = (ti, kind)
+                            break
+                    if hit_tab:
+                        ti, kind = hit_tab
+                        if btn in (2, 3):        # 右键：切标签并换色彩标记
+                            switch_tab(ti)
+                            tab_cycle_color(1)
+                        elif kind == "close":
+                            close_specific_tab(ti)
+                        else:
+                            switch_tab(ti)
+                    elif mx > (tab_boxes[-1][1] if tab_boxes else 0):
+                        new_tab()
+                    continue
 
                 if my == btn_row:
                     for rb in rendered_buttons:
@@ -925,6 +3597,39 @@ def tui_main(stdscr):
             continue
 
         # ---- 列表页键盘 ----
+        if mode == MODE_MENU:
+            if key in ("ESC", "q"):
+                mode = MODE_LIST
+                dirty = True
+            elif key in ("LEFT", "ALT_LEFT"):
+                menu_idx = (menu_idx - 1) % len(MENUS)
+                menu_sel = 0
+                dirty = True
+            elif key in ("RIGHT", "ALT_RIGHT"):
+                menu_idx = (menu_idx + 1) % len(MENUS)
+                menu_sel = 0
+                dirty = True
+            elif key == "UP":
+                menu_sel = max(0, menu_sel - 1)
+                dirty = True
+            elif key == "DOWN":
+                menu_sel = min(len(MENUS[menu_idx][1]) - 1, menu_sel + 1)
+                dirty = True
+            elif key == "ENTER":
+                act = MENUS[menu_idx][1][menu_sel][2]
+                if act == "quit":
+                    return
+                mode = MODE_LIST
+                menu_action(act)
+                continue
+            elif key in ("ALT_F", "ALT_E", "ALT_V", "ALT_W", "ALT_H"):
+                open_menu({"ALT_F": 0, "ALT_E": 1, "ALT_V": 2,
+                           "ALT_W": 3, "ALT_H": 4}[key])
+            elif key == "\t":
+                menu_idx = (menu_idx + 1) % len(MENUS)
+                menu_sel = 0
+                dirty = True
+
         if mode == MODE_LIST:
             if search_mode:
                 search_matches = compute_search_matches(search_keyword)
@@ -940,6 +3645,73 @@ def tui_main(stdscr):
                     search_keyword = search_keyword[:-1]
                 else:
                     search_keyword += key
+                continue
+
+            # ---- 菜单栏与标签页快捷键 ----
+            if key in ("ALT_F", "ALT_E", "ALT_V", "ALT_W", "ALT_H"):
+                open_menu({"ALT_F": 0, "ALT_E": 1, "ALT_V": 2,
+                           "ALT_W": 3, "ALT_H": 4}[key])
+                continue
+            if key == "m":
+                open_menu(0)
+                continue
+            if key == "\x14":          # Ctrl+T 新建标签页
+                new_tab()
+                continue
+            if key == "\x17":          # Ctrl+W 关闭当前标签页
+                close_tab()
+                continue
+            if key == "\x02":          # Ctrl+B 下一个标签页
+                next_tab()
+                continue
+            if isinstance(key, str) and key.startswith("ALT_") and len(key) == 5 \
+                    and key[4].isdigit():
+                idx = int(key[4]) - 1
+                if 0 <= idx < len(tabs):
+                    switch_tab(idx)
+                continue
+
+            # ---- 文件管理快捷键（Ctrl/Alt 组合）----
+            if key == "\x03":          # Ctrl+C 复制
+                clipboard_mark("copy")
+                continue
+            if key == "\x18":          # Ctrl+X 剪切
+                clipboard_mark("cut")
+                continue
+            if key == "\x16":          # Ctrl+V 粘贴
+                clipboard_paste()
+                continue
+            if key == "\x06":          # Ctrl+F 搜索
+                mode = MODE_FIND
+                find_query = ""
+                find_cur = len(find_query)
+                find_note = ""
+                dirty = True
+                continue
+            if key == "BACKSPACE":       # 退格 = 直接粉碎（仍走两级确认）
+                shred_from_selection()
+                continue
+            if key == "ALT_R":
+                open_openwith()
+                continue
+            if key == "ALT_T":
+                open_tab_rename()
+                continue
+            if key == "ALT_C":
+                tab_cycle_color(1)
+                continue
+            if key in ("ALT_LEFT", "ALT_BS"):
+                nav_jump(-1)
+                continue
+            if key == "ALT_RIGHT":
+                nav_jump(1)
+                continue
+            if key == "ALT_ENTER":
+                open_props()
+                continue
+            if key == "?":
+                mode = MODE_HELP
+                dirty = True
                 continue
 
             if key == '/':
@@ -985,7 +3757,12 @@ def tui_main(stdscr):
             elif key == ':':
                 mode = MODE_CMDLINE
                 cmd_buffer = ""
+                cmd_cur = len(cmd_buffer)
                 cmd_error = ""
+                cmd_note = ""
+                cmd_search_mode = False
+                cmd_search_q = ""
+                cmd_search_pos = None
                 cmd_hist_idx = len(hist_list)
                 cmd_draft = ""
                 dirty = True
@@ -995,11 +3772,132 @@ def tui_main(stdscr):
                 goto_prev_match()
 
         # ---- 命令行（含 shell history ↑↓ 调取：内存 + 家目录文件合并）----
+        elif mode == MODE_PICK:
+            if key == "UP":
+                if pick_sel > 0:
+                    pick_sel -= 1
+                    dirty = True
+            elif key == "DOWN":
+                if pick_sel < len(pick_items) - 1:
+                    pick_sel += 1
+                    dirty = True
+            elif key == "\t":
+                # 连按 Tab 就在候选里往下走，避免手快误确认
+                if pick_items:
+                    pick_sel = (pick_sel + 1) % len(pick_items)
+                    dirty = True
+            elif key == "ENTER":
+                if pick_items:
+                    label, val = pick_items[pick_sel]
+                    if pick_ctx == "complete":
+                        cmd_buffer = pick_prefix + val
+                        cmd_cur = len(cmd_buffer)
+                        cmd_note = f"已选: {label}"
+                    elif pick_ctx == "tab":
+                        switch_tab(int(val))
+                    pick_items = []
+                    mode = MODE_CMDLINE
+                    dirty = True
+            elif key == "ESC":
+                pick_items = []
+                cmd_note = "已取消选择（命令行内容保留）"
+                mode = MODE_CMDLINE
+                dirty = True
+
         elif mode == MODE_CMDLINE:
+            # ===== Ctrl+R 反向搜索（bash 式增量查找历史 + 菜单选择）=====
+            if key == "\x12":
+                if not hist_list:
+                    cmd_note = "历史为空，无法反向搜索"
+                    dirty = True
+                    continue
+                if cmd_search_mode and cmd_search_matches:
+                    # 已在搜索态：Ctrl+R = 选中下一条更旧的匹配
+                    cmd_search_sel = min(len(cmd_search_matches) - 1, cmd_search_sel + 1)
+                    cmd_search_pos = cmd_search_matches[cmd_search_sel]
+                    cmd_buffer = hist_list[cmd_search_pos]
+                    cmd_cur = len(cmd_buffer)
+                    dirty = True
+                    continue
+                if not cmd_search_mode:
+                    cmd_search_mode = True
+                    cmd_search_q = ""
+                cmd_search_matches = search_hist_all(hist_list, cmd_search_q)
+                cmd_search_sel = 0
+                if cmd_search_matches:
+                    cmd_search_pos = cmd_search_matches[0]
+                    cmd_buffer = hist_list[cmd_search_pos]
+                    cmd_cur = len(cmd_buffer)
+                    cmd_note = ""
+                else:
+                    cmd_note = ("还没有历史命令，先执行几条 :cd / :select 之类的命令"
+                                if not cmd_search_q else f"无匹配: {cmd_search_q}")
+                dirty = True
+                continue
+
+            # ===== 搜索态：输入 / 退格 / 方向键选菜单 / 回车确认 / ESC 退出 =====
+            if cmd_search_mode:
+                if key == "ESC":
+                    cmd_search_mode = False
+                    cmd_note = "已退出搜索，内容保留（再按 ESC 才取消命令）"
+                    dirty = True
+                    continue
+                if key in ("UP", "DOWN"):
+                    if cmd_search_matches:
+                        step = -1 if key == "UP" else 1
+                        cmd_search_sel = max(0, min(len(cmd_search_matches) - 1,
+                                                    cmd_search_sel + step))
+                        cmd_search_pos = cmd_search_matches[cmd_search_sel]
+                        cmd_buffer = hist_list[cmd_search_pos]
+                        cmd_cur = len(cmd_buffer)
+                    else:
+                        cmd_note = f"无匹配: {cmd_search_q}"
+                    dirty = True
+                    continue
+                if key == "BACKSPACE" or (isinstance(key, str) and len(key) == 1
+                                          and key not in ("\t", "\x12")):
+                    if key == "BACKSPACE":
+                        cmd_search_q = cmd_search_q[:-1]
+                    else:
+                        cmd_search_q += key
+                    cmd_search_matches = search_hist_all(hist_list, cmd_search_q)
+                    cmd_search_sel = 0
+                    if cmd_search_matches:
+                        cmd_search_pos = cmd_search_matches[0]
+                        cmd_buffer = hist_list[cmd_search_pos]
+                        cmd_cur = len(cmd_buffer)
+                        cmd_note = ""
+                    else:
+                        cmd_note = (f"无匹配: {cmd_search_q}" if cmd_search_q
+                                    else "输入关键词开始搜索")
+                    dirty = True
+                    continue
+                if key == "ENTER":
+                    if cmd_search_matches:
+                        cmd_search_pos = cmd_search_matches[cmd_search_sel]
+                        cmd_buffer = hist_list[cmd_search_pos]
+                        cmd_cur = len(cmd_buffer)
+                        cmd_hist_idx = cmd_search_pos
+                    cmd_search_mode = False
+                    cmd_note = "已选历史命令，可编辑后再 ENTER 执行"
+                    dirty = True
+                    continue
+                # 其它键（Tab 等）：退出搜索，交给正常逻辑
+                cmd_search_mode = False
+                dirty = True
+
+            # ===== Tab 补全 =====
+            if key == "\t":
+                do_complete()
+                continue
+
             if key == "ESC":
                 mode = MODE_LIST
                 cmd_buffer = ""
+                cmd_cur = len(cmd_buffer)
                 cmd_error = ""
+                cmd_note = ""
+                cmd_search_mode = False
                 cmd_hist_idx = len(hist_list)
                 cmd_draft = ""
                 dirty = True
@@ -1011,6 +3909,7 @@ def tui_main(stdscr):
                     if cmd_hist_idx > 0:
                         cmd_hist_idx -= 1
                         cmd_buffer = hist_list[cmd_hist_idx]
+                        cmd_cur = len(cmd_buffer)
                     dirty = True
             elif key == "DOWN":
                 # 下翻历史：越过末尾回到草稿
@@ -1018,21 +3917,26 @@ def tui_main(stdscr):
                     if cmd_hist_idx < len(hist_list) - 1:
                         cmd_hist_idx += 1
                         cmd_buffer = hist_list[cmd_hist_idx]
+                        cmd_cur = len(cmd_buffer)
                     elif cmd_hist_idx >= len(hist_list) - 1:
                         cmd_hist_idx = len(hist_list)
                         cmd_buffer = cmd_draft
+                        cmd_cur = len(cmd_buffer)
                     dirty = True
             elif key == "ENTER":
                 raw_cmd = cmd_buffer.strip()
                 parts = raw_cmd.split(maxsplit=1)
                 cmd_error = ""
+                skip_record = False      # :hist 之类不写进历史
+                stay_cmdline = False     # 执行完仍留在命令行（不被弹回列表）
                 if not parts:
                     mode = MODE_LIST
                     dirty = True
                     continue
                 cmd = parts[0]
+                cmd_l = cmd.lower()   # 命令关键字大小写不敏感
                 rest = parts[1] if len(parts) >= 2 else ""
-                if cmd == "cd":
+                if cmd_l == "cd":
                     arg = rest.strip()
                     if not arg:
                         cmd_error = "cd 需要路径参数，例如 :cd /sdcard"
@@ -1063,7 +3967,7 @@ def tui_main(stdscr):
                                 current_pwd = target
                                 status_msg = ""
                                 rescan_directory()
-                elif cmd == "select":
+                elif cmd_l == "select":
                     arg = rest.strip()
                     if arg == "":
                         if scan_entries and 0 <= cursor_idx < len(scan_entries):
@@ -1084,7 +3988,151 @@ def tui_main(stdscr):
                         hit, msg = select_multi_condition(arg)
                         cmd_error = "" if hit > 0 else "没有条目符合条件"
                         set_status(msg if hit > 0 else "0 项匹配")
-                elif cmd == "history":
+                elif cmd_l.startswith("about:"):
+                    # 火狐式入口：:about:preferences / :about:config / :about:about
+                    target = cmd_l.split(":", 1)[1].strip()
+                    if target in ("config",):
+                        mode = MODE_CONFIG
+                        cfg_cursor = 0
+                        cfg_note = ""
+                    elif target in ("preferences", "prefs", "settings", "set"):
+                        mode = MODE_PREFS
+                        prefs_cursor = 0
+                        settings_note = ""
+                    elif target in ("about", "info", "version", ""):
+                        mode = MODE_ABOUT
+                    else:
+                        cmd_error = (f"about:{target} 不存在，可用: "
+                                     "about:preferences / about:config / about:about")
+                    dirty = True
+                elif cmd_l in ("about", "info"):
+                    mode = MODE_ABOUT
+                    dirty = True
+                elif cmd_l in ("preferences", "prefs", "settings", "set"):
+                    mode = MODE_PREFS
+                    prefs_cursor = 0
+                    settings_note = ""
+                    dirty = True
+                elif cmd_l in ("hist", "r", "hist-search"):
+                    # 不依赖 Ctrl+R 的入口：手机上点不到 Ctrl 也能用
+                    if not hist_list:
+                        cmd_error = f"历史为空（{HISTORY_FILE}）"
+                    else:
+                        cmd_search_mode = True
+                        cmd_search_q = rest.strip()
+                        cmd_search_matches = search_hist_all(hist_list, cmd_search_q)
+                        cmd_search_sel = 0
+                        if cmd_search_matches:
+                            cmd_search_pos = cmd_search_matches[0]
+                            cmd_buffer = hist_list[cmd_search_pos]
+                            cmd_cur = len(cmd_buffer)
+                            cmd_note = "继续输入关键词收窄 · ↑↓ 选 · ENTER 确认"
+                        else:
+                            cmd_search_q += ""
+                            cmd_note = f"无匹配: {cmd_search_q}，继续输入试试"
+                            cmd_buffer = ""
+                            cmd_cur = len(cmd_buffer)
+                    skip_record = True
+                    stay_cmdline = True
+                    dirty = True
+                elif cmd_l in ("find", "search"):
+                    # 手机上 Alt / Ctrl 不灵时的等价入口
+                    find_query = rest.strip()
+                    find_cur = len(find_query)
+                    if not find_query:
+                        cmd_error = "find 需要关键词，例如 :find deep"
+                    else:
+                        run_find()
+                        mode = MODE_FIND_RES
+                elif cmd_l in ("tab", "tabs"):
+                    arg = (rest or "").strip().lower()
+                    if arg in ("", "list"):
+                        open_pick("标签页", [(f"{i + 1}. {tab_title(i)}"
+                                              f"{'  ←当前' if i == tab_idx else ''}", i)
+                                             for i in range(len(tabs))], "tab", "")
+                    elif arg in ("new", "n", "+"):
+                        new_tab()
+                    elif arg in ("close", "c", "x"):
+                        close_tab()
+                    elif arg in ("next", "nxt"):
+                        next_tab()
+                    elif arg in ("prev", "p"):
+                        prev_tab()
+                    elif arg.isdigit():
+                        switch_tab(int(arg) - 1)
+                    elif arg.split()[:1] == ["rename"]:
+                        nm = rest.strip()[len("rename"):].strip()
+                        if tab_idx >= len(tabs):
+                            pass
+                        else:
+                            if tabs[tab_idx] is None:
+                                tab_snapshot()
+                            tabs[tab_idx]["name"] = nm
+                            set_status(f"标签页 {tab_idx + 1} 重命名为: {nm}" if nm
+                                       else "已恢复默认名称")
+                            dirty = True
+                    elif arg.split()[:1] == ["color"]:
+                        want = arg.split()[1:] and arg.split()[1] or ""
+                        names = {n: k for k, n in enumerate(TAB_COLOR_NAMES)}
+                        if want in names:
+                            if tabs[tab_idx] is None:
+                                tab_snapshot()
+                            tabs[tab_idx]["color"] = names[want]
+                            set_status(f"标签页 {tab_idx + 1} 颜色: {want}")
+                        else:
+                            tab_cycle_color(1)
+                        dirty = True
+                    else:
+                        cmd_error = ("用法: :tab new|close|next|prev|list|1-9|"
+                                     "rename 名字|color 默认/绿/黄/蓝/紫/红/青")
+                elif cmd_l in ("menu", "menubar"):
+                    arg = (rest or "").strip().lower()
+                    order = {"file": 0, "edit": 1, "view": 2, "window": 3,
+                             "windows": 3, "help": 4}
+                    open_menu(order.get(arg, 0))
+                elif cmd_l in ("props", "prop", "info"):
+                    open_props()
+                elif cmd_l in ("open", "openwith", "open-with"):
+                    open_openwith()
+                elif cmd_l in ("opts", "options", "folderopts", "display"):
+                    arg = (rest or "").strip().lower()
+                    if arg in ("hidden", "hidden-on"):
+                        PREFS["show_hidden"] = True
+                        save_prefs()
+                        refresh_after_options()
+                        set_status("已显示隐藏文件")
+                    elif arg in ("hidden-off", "nohidden"):
+                        PREFS["show_hidden"] = False
+                        save_prefs()
+                        refresh_after_options()
+                        set_status("已隐藏 . 开头的文件")
+                    elif arg in ("ext", "ext-on", "hideext"):
+                        PREFS["hide_ext"] = True
+                        save_prefs()
+                        refresh_after_options()
+                        set_status("已隐藏已知文件类型的扩展名")
+                    elif arg in ("ext-off", "showext"):
+                        PREFS["hide_ext"] = False
+                        save_prefs()
+                        refresh_after_options()
+                        set_status("已显示已知文件类型的扩展名")
+                    elif arg in ("reset", "default"):
+                        foldopts_reset()
+                    else:
+                        open_foldopts()
+                elif cmd_l in ("dirprops", "folderprops", "folder"):
+                    open_folder_props()
+                elif cmd_l in ("back", "prev"):
+                    nav_jump(-1)
+                elif cmd_l in ("fwd", "forward", "next"):
+                    nav_jump(1)
+                elif cmd_l in ("copy", "cp"):
+                    clipboard_mark("copy")
+                elif cmd_l in ("cut", "mv"):
+                    clipboard_mark("cut")
+                elif cmd_l in ("paste", "put"):
+                    clipboard_paste()
+                elif cmd_l == "history":
                     if not hist_list:
                         set_status(f"历史为空（文件 {HISTORY_FILE}）")
                     else:
@@ -1094,34 +4142,443 @@ def tui_main(stdscr):
                     save_history(hist_list)
                     set_status(f"历史已清空（{HISTORY_FILE}）")
                 else:
-                    cmd_error = f"unknown cmd: {cmd}，支持 cd / select / history"
+                    cmd_error = (f"unknown cmd: {cmd}，支持 cd / select / history / hist / "
+                                 "find / props / copy / cut / paste / back / fwd / about / preferences")
 
-                # 成功失败都记入历史（方便直接 ↑ 重试）
-                hist_list = append_history(hist_list, raw_cmd)
-                cmd_hist_idx = len(hist_list)
+                # 成功失败都记入历史（方便直接 ↑ 重试）；:hist 本身不记录
+                if not skip_record:
+                    hist_list = append_history(hist_list, raw_cmd)
+                    cmd_hist_idx = len(hist_list)
                 cmd_draft = ""
-                if not cmd_error:
+                # 只有当命令处理完仍在命令行态时才退回列表；
+                # :about / :preferences / :hist 已经自己切了 mode，不能被覆盖
+                if not cmd_error and mode == MODE_CMDLINE and not stay_cmdline:
                     mode = MODE_LIST
                 dirty = True
-            elif key == "BACKSPACE":
-                if cmd_hist_idx < len(hist_list):
-                    # 从历史项继续编辑 → 视为新命令，不污染原条目
-                    cmd_hist_idx = len(hist_list)
-                    cmd_draft = cmd_buffer
-                cmd_buffer = cmd_buffer[:-1]
+            else:
+                # ←→ / HOME / END / DEL / BS / 可打印字符：统一按光标位置编辑
+                new_buf, new_cur, handled = edit_buffer(cmd_buffer, cmd_cur, key)
+                if handled:
+                    if new_buf != cmd_buffer and cmd_hist_idx < len(hist_list):
+                        # 从历史项继续编辑 → 视为新命令，不污染原条目
+                        cmd_hist_idx = len(hist_list)
+                        cmd_draft = new_buf
+                    cmd_buffer, cmd_cur = new_buf, new_cur
+                    dirty = True
+
+        # ---- 关于 / 设置（:about / :preferences）----
+        elif mode == MODE_ABOUT:
+            if key in ("ESC", "ENTER", "q", "Q"):
+                mode = MODE_LIST
+                dirty = True
+
+        elif mode == MODE_PREFS:
+            if key in ("ESC", "q"):
+                mode = MODE_LIST
+                status_msg = ""
+                dirty = True
+            elif key == "UP":
+                prefs_cursor = max(0, prefs_cursor - 1)
+                settings_note = ""
+                dirty = True
+            elif key == "DOWN":
+                prefs_cursor = min(7, prefs_cursor + 1)
+                settings_note = ""
+                dirty = True
+            elif key in ("LEFT", "-", "_"):
+                if prefs_cursor == 0:
+                    PREFS["passes"] = max(1, PREFS["passes"] - 1)
+                    save_prefs()
+                    settings_note = f"passes = {PREFS['passes']}"
+                    dirty = True
+                elif prefs_cursor == 2:
+                    cycle_start_mode(-1)
+                    settings_note = "启动路径策略 = " + START_MODE_LABELS[PREFS["start_mode"]]
+                    dirty = True
+            elif key in ("RIGHT", "+", "="):
+                if prefs_cursor == 0:
+                    PREFS["passes"] = min(9, PREFS["passes"] + 1)
+                    save_prefs()
+                    settings_note = f"passes = {PREFS['passes']}"
+                    dirty = True
+                elif prefs_cursor == 2:
+                    cycle_start_mode(+1)
+                    settings_note = "启动路径策略 = " + START_MODE_LABELS[PREFS["start_mode"]]
+                    dirty = True
+            elif key == " ":
+                if prefs_cursor == 1:
+                    PREFS["use_system_shred"] = not PREFS["use_system_shred"]
+                    USE_SYSTEM_SHRED = PREFS["use_system_shred"]
+                    save_prefs()
+                    settings_note = ("engine = system shred"
+                                     if PREFS["use_system_shred"]
+                                     else "engine = built-in python")
+                    dirty = True
+            elif key == "ENTER":
+                if prefs_cursor == 0:
+                    PREFS["passes"] = PREFS["passes"] % 9 + 1
+                    save_prefs()
+                    settings_note = f"passes = {PREFS['passes']}"
+                    dirty = True
+                elif prefs_cursor == 1:
+                    PREFS["use_system_shred"] = not PREFS["use_system_shred"]
+                    USE_SYSTEM_SHRED = PREFS["use_system_shred"]
+                    save_prefs()
+                    settings_note = ("engine = system shred"
+                                     if PREFS["use_system_shred"]
+                                     else "engine = built-in python")
+                    dirty = True
+                elif prefs_cursor == 2:
+                    cycle_start_mode(+1)
+                    settings_note = "启动路径策略 = " + START_MODE_LABELS[PREFS["start_mode"]]
+                    dirty = True
+                elif prefs_cursor == 3:
+                    mode = MODE_PREFS_EDIT
+                    prefs_edit_buffer = PREFS["default_dir"]
+                    prefs_edit_cur = len(prefs_edit_buffer)
+                    settings_note = ""
+                    dirty = True
+                elif prefs_cursor == 4:
+                    # 把当前目录记为“上次运行目录”
+                    PREFS["last_dir"] = current_pwd
+                    save_prefs()
+                    settings_note = f"上次目录 = {current_pwd}"
+                    dirty = True
+                elif prefs_cursor == 5:
+                    n = len(hist_list)
+                    hist_list = []
+                    save_history(hist_list)
+                    settings_note = f"已清空 {n} 条 shell history"
+                    dirty = True
+                elif prefs_cursor == 6:
+                    PREFS.update(dict(DEFAULT_PREFS))
+                    USE_SYSTEM_SHRED = PREFS["use_system_shred"]
+                    save_prefs()
+                    settings_note = "已恢复默认设置"
+                    dirty = True
+                else:
+                    mode = MODE_LIST
+                    dirty = True
+            elif key == "R":
+                # 按 R：丢弃内存值，重新从 JSON 读回
+                reload_prefs_from_disk()
+                settings_note = (f"已从磁盘重载：passes={PREFS['passes']}, "
+                                 f"start_mode={PREFS['start_mode']}")
+                dirty = True
+            elif key == "r":
+                PREFS.update(dict(DEFAULT_PREFS))
+                USE_SYSTEM_SHRED = PREFS["use_system_shred"]
+                save_prefs()
+                settings_note = "已恢复默认设置"
+                dirty = True
+
+        elif mode == MODE_CONFIG:
+            if key in ("ESC", "q"):
+                mode = MODE_LIST
+                status_msg = ""
+                cfg_note = ""
+                dirty = True
+            elif key == "UP":
+                cfg_cursor = max(0, cfg_cursor - 1)
+                cfg_note = ""
+                dirty = True
+            elif key == "DOWN":
+                cfg_cursor = min(len(CONFIG_KEYS) - 1, cfg_cursor + 1)
+                cfg_note = ""
+                dirty = True
+            elif key == "ENTER":
+                key_name, kind, _ = CONFIG_KEYS[cfg_cursor]
+                mode = MODE_CONFIG_EDIT
+                cfg_edit_buffer = config_value_to_text(key_name, kind)
+                cfg_edit_cur = len(cfg_edit_buffer)
+                cfg_note = ""
+                dirty = True
+            elif key in ("R",):
+                reload_prefs_from_disk()
+                cfg_note = f"已从磁盘重载：passes={PREFS['passes']}, start_mode={PREFS['start_mode']}"
+                dirty = True
+            elif key in ("s", "S", "\x13"):
+                ok = save_prefs()
+                cfg_note = f"已写入 {PREFS_FILE}" if ok else "写入失败（目录不可写）"
+                dirty = True
+            elif key in ("r",):
+                PREFS.update(dict(DEFAULT_PREFS))
+                USE_SYSTEM_SHRED = PREFS["use_system_shred"]
+                ok = save_prefs()
+                cfg_note = "已恢复默认并保存" if ok else "已恢复默认（保存失败，仅内存生效）"
+                dirty = True
+
+        elif mode == MODE_OPENSEARCH:
+            progs = filtered_programs()
+            if key in ("ESC", "q"):
+                mode = MODE_OPENWITH
+                dirty = True
+            elif key == "UP":
+                ow_prog_sel = max(0, ow_prog_sel - 1)
+                dirty = True
+            elif key == "DOWN":
+                ow_prog_sel = min(max(0, len(progs) - 1), ow_prog_sel + 1)
+                dirty = True
+            elif key == "PGUP":
+                ow_prog_sel = max(0, ow_prog_sel - 10)
+                dirty = True
+            elif key == "PGDN":
+                ow_prog_sel = min(max(0, len(progs) - 1), ow_prog_sel + 10)
+                dirty = True
+            elif key == "ENTER":
+                run_searched_program()
+            elif key == "\x06":       # Ctrl+F：重新扫描程序清单
+                system_programs(refresh=True)
+                set_status(f"已重新扫描：{len(system_programs())} 个程序")
                 dirty = True
             else:
-                if isinstance(key, str) and len(key) > 1:
-                    # LEFT / RIGHT 等多字符序列忽略，避免拼进命令
-                    pass
+                new_buf, new_cur, handled = edit_buffer(ow_filter, ow_cur, key)
+                if handled:
+                    ow_filter, ow_cur = new_buf, new_cur
+                    ow_prog_sel = 0
+                    dirty = True
+
+        elif mode == MODE_OPENWITH:
+            if key in ("ESC", "q"):
+                mode = MODE_LIST
+                set_status("已取消打开方式")
+                dirty = True
+            elif key == "UP":
+                ow_sel = max(0, ow_sel - 1)
+                dirty = True
+            elif key == "DOWN":
+                ow_sel = min(max(0, len(ow_items) - 1), ow_sel + 1)
+                dirty = True
+            elif key == "r":
+                open_openwith()
+            elif key == "ENTER":
+                run_open_with()
+            elif key.isdigit():
+                run_open_with(int(key) - 1)
+
+        elif mode == MODE_TABNAME:
+            if key == "ESC":
+                mode = MODE_LIST
+                set_status("已取消重命名")
+                dirty = True
+            elif key == "ENTER":
+                apply_tab_rename()
+            elif key == "ALT_C":
+                tab_cycle_color(1)
+            else:
+                new_buf, new_cur, handled = edit_buffer(tab_name_buf, tab_name_cur, key)
+                if handled:
+                    tab_name_buf, tab_name_cur = new_buf, new_cur
+                    dirty = True
+
+        elif mode == MODE_FOLDOPTS:
+            if key in ("ESC", "q"):
+                mode = MODE_LIST
+                save_prefs()
+                dirty = True
+            elif key == "UP":
+                foldopts_idx = max(0, foldopts_idx - 1)
+                foldopts_note = ""
+                dirty = True
+            elif key == "DOWN":
+                foldopts_idx = min(len(FOLDOPTS), foldopts_idx + 1)
+                foldopts_note = ""
+                dirty = True
+            elif key in ("ENTER", " ", "SPACE"):
+                if foldopts_idx == len(FOLDOPTS):
+                    foldopts_reset()
                 else:
-                    if cmd_hist_idx < len(hist_list):
-                        cmd_hist_idx = len(hist_list)
-                        cmd_draft = cmd_buffer
-                    cmd_buffer += key
+                    key_name, _lab, kind = FOLDOPTS[foldopts_idx]
+                    foldopt_toggle(key_name, kind, 1)
+            elif key in ("LEFT", "-"):
+                if foldopts_idx < len(FOLDOPTS):
+                    key_name, _lab, kind = FOLDOPTS[foldopts_idx]
+                    if kind == "cycle":
+                        foldopt_toggle(key_name, kind, -1)
+                    else:
+                        PREFS[key_name] = not bool(PREFS.get(key_name))
+                        save_prefs()
+                        refresh_after_options()
+            elif key in ("RIGHT", "+", "="):
+                if foldopts_idx < len(FOLDOPTS):
+                    key_name, _lab, kind = FOLDOPTS[foldopts_idx]
+                    foldopt_toggle(key_name, kind, 1)
+            elif key == "r":
+                foldopts_reset()
+            elif key == "R":
+                PREFS.update(load_prefs())
+                USE_SYSTEM_SHRED = bool(PREFS.get("use_system_shred", True))
+                refresh_after_options()
+                foldopts_note = "已从磁盘重载显示选项"
+                dirty = True
+
+        elif mode == MODE_CONFIG_EDIT:
+            if key == "ESC":
+                mode = MODE_CONFIG
+                cfg_note = "已取消修改"
+                dirty = True
+            elif key == "ENTER":
+                key_name, kind, _ = CONFIG_KEYS[cfg_cursor]
+                ok, res = parse_config_value(key_name, kind, cfg_edit_buffer)
+                if not ok:
+                    cfg_note = str(res)
+                    dirty = True
+                else:
+                    PREFS[key_name] = res
+                    if key_name == "use_system_shred":
+                        USE_SYSTEM_SHRED = bool(res)
+                    saved = save_prefs()
+                    mode = MODE_CONFIG
+                    cfg_note = (f"{key_name} = {res}" if saved
+                                else f"{key_name} = {res}（保存失败，仅内存生效）")
+                    dirty = True
+            else:
+                new_buf, new_cur, handled = edit_buffer(cfg_edit_buffer, cfg_edit_cur, key)
+                if handled:
+                    cfg_edit_buffer, cfg_edit_cur = new_buf, new_cur
+                    dirty = True
+
+        elif mode == MODE_PREFS_EDIT:
+            if key == "ESC":
+                mode = MODE_PREFS
+                settings_note = "已取消修改"
+                dirty = True
+            elif key == "ENTER":
+                raw = prefs_edit_buffer.strip()
+                if not raw:
+                    settings_note = "路径不能为空"
+                    dirty = True
+                else:
+                    p = os.path.abspath(os.path.expanduser(raw))
+                    if os.path.isdir(p):
+                        PREFS["default_dir"] = p
+                        save_prefs()
+                        mode = MODE_PREFS
+                        settings_note = f"默认目录 → {p}"
+                        dirty = True
+                    elif os.path.exists(p):
+                        settings_note = f"目标不是文件夹: {p}"
+                        dirty = True
+                    else:
+                        settings_note = f"路径不存在: {p}"
+                        dirty = True
+            else:
+                new_buf, new_cur, handled = edit_buffer(prefs_edit_buffer, prefs_edit_cur, key)
+                if handled:
+                    prefs_edit_buffer, prefs_edit_cur = new_buf, new_cur
                     dirty = True
 
         # ---- 预览 / 双重确认 ----
+        elif mode == MODE_FIND:
+            if key == "ESC":
+                mode = MODE_LIST
+                find_query = ""
+                find_cur = len(find_query)
+                find_note = ""
+                dirty = True
+            elif key in ("\t", "TAB", "LEFT", "RIGHT", "BTAB"):
+                step = -1 if key in ("LEFT", "BTAB") else 1
+                find_scope_idx = (find_scope_idx + step) % len(FIND_SCOPES)
+                find_note = f"范围 → {FIND_SCOPES[find_scope_idx]}"
+                dirty = True
+            elif key == "ENTER":
+                run_find()
+            else:
+                new_buf, new_cur, handled = edit_buffer(find_query, find_cur, key)
+                if handled:
+                    find_query, find_cur = new_buf, new_cur
+                    dirty = True
+
+        elif mode == MODE_FIND_RES:
+            if key == "\x06":          # 在结果页再按 Ctrl+F：回到输入框改词
+                mode = MODE_FIND
+                find_cur = len(find_query)
+                dirty = True
+            elif key in ("ESC", "q"):
+                mode = MODE_LIST
+                dirty = True
+            elif key == "BACKSPACE":
+                mode = MODE_FIND
+                dirty = True
+            elif key == "UP":
+                find_sel = max(0, find_sel - 1)
+                dirty = True
+            elif key == "DOWN":
+                if find_hits:
+                    find_sel = min(len(find_hits) - 1, find_sel + 1)
+                dirty = True
+            elif key == "PGUP":
+                find_sel = max(0, find_sel - 10)
+                dirty = True
+            elif key == "PGDN":
+                if find_hits:
+                    find_sel = min(len(find_hits) - 1, find_sel + 10)
+                dirty = True
+            elif key == "ENTER":
+                if find_hits:
+                    goto_find_hit(find_hits[find_sel])
+                else:
+                    set_status("没有可跳转的结果")
+
+        elif mode == MODE_PROPS:
+            if key in ("i", "I"):
+                enter_props_edit()
+            elif key in ("ESC", "ENTER", "q"):
+                mode = MODE_LIST
+                prop_off = 0
+                dirty = True
+            elif key in ("UP", "PGUP"):
+                step = 1 if key == "UP" else 10
+                prop_off = max(0, prop_off - step)
+                dirty = True
+            elif key in ("DOWN", "PGDN"):
+                step = 1 if key == "DOWN" else 10
+                prop_off = min(max(0, len(prop_text) - 1), prop_off + step)
+                dirty = True
+
+        elif mode == MODE_PROPS_EDIT:
+            if key == "ESC":
+                mode = MODE_PROPS
+                prop_msg = ""
+                refresh_props()
+                dirty = True
+            elif key == "UP":
+                prop_edit_idx = max(0, prop_edit_idx - 1)
+                prop_msg = ""
+                dirty = True
+            elif key == "DOWN":
+                prop_edit_idx = min(len(PROP_FIELDS) - 1, prop_edit_idx + 1)
+                prop_msg = ""
+                dirty = True
+            elif key == "ENTER":
+                begin_prop_entry()
+            elif key == "r":
+                refresh_props()
+                prop_msg = "已重新读取磁盘属性"
+                dirty = True
+
+        elif mode == MODE_PROPS_ENTRY:
+            if key == "ESC":
+                mode = MODE_PROPS_EDIT
+                prop_msg = "已放弃修改"
+                dirty = True
+            elif key == "ENTER":
+                ok, msg = apply_prop_edit()
+                prop_msg = ("✓ " if ok else "✗ ") + msg
+                refresh_props()
+                mode = MODE_PROPS_EDIT
+                dirty = True
+            else:
+                new_buf, new_cur, handled = edit_buffer(prop_edit_buf, prop_cur, key)
+                if handled:
+                    prop_edit_buf, prop_cur = new_buf, new_cur
+                    dirty = True
+
+        elif mode == MODE_HELP:
+            if key in ("ESC", "ENTER", "q", "?"):
+                mode = MODE_LIST
+                dirty = True
+
         elif mode == MODE_PREVIEW:
             if key == "ENTER":
                 mode = MODE_CONFIRM1
@@ -1164,9 +4621,70 @@ def tui_main(stdscr):
 
 if __name__ == "__main__":
     USE_SYSTEM_SHRED = True
+
+    args = sys.argv[1:]
+    if "-h" in args or "--help" in args:
+        print(f"FileShredder {VERSION}  用法: python fileshredder.py [起始路径]")
+        print("  不带参数        → 默认 /storage/emulated/0/Download/shred_test")
+        print("  给一个目录      → 直接从该目录启动")
+        print("  给一个文件      → 进入其所在目录并预勾选该文件")
+        print("  路径不存在      → 自动回退到最近存在的父目录并在状态栏提示")
+        print("")
+        print("启动路径策略（:about:preferences 里切换）:")
+        print("  default 默认路径      argv 命令行指定")
+        print("  cwd     当前目录      last 上次运行目录")
+        print("  给了路径参数时永远优先于策略")
+        print("")
+        print("列表页快捷键:")
+        print("  ↑↓/滚轮 移动   SPACE/点击 勾选   ENTER 进目录  BACKSPACE 粉碎(两级确认)")
+        print("  Ctrl+C 复制   Ctrl+X 剪切   Ctrl+V 粘贴到当前目录")
+        print("  ALT+←/ALT+BS 返回上一目录   ALT+→ 前进   Ctrl+F 递归搜索   ALT+ENTER 属性")
+        print("  属性页里按 I → 编辑属性条目（名称 / 权限 / 修改时间）")
+        print("  所有输入框（命令行 / 搜索 / 属性）支持 ←→ 移动光标、HOME/END 首尾、DEL 删右侧")
+        print("  命令行等价: :copy / :cut / :paste / :find kw / :props / :back / :fwd / :hist")
+        print("  M 打开菜单栏 File/Edit/View/Window/Help（ALT+F..H 直接开某个菜单）")
+        print("  Ctrl+T 新建标签页   Ctrl+W 关闭标签页   ALT+1..9 切标签   点底栏也能切")
+        print("  ALT+R 打开方式（列出可用程序）  ALT+T 重命名标签  ALT+C 标签颜色")
+        print("  :open / :openwith 打开方式对话框（也可 Edit 菜单）")
+        print("  打开方式支持批量（多选后一次打开）；「其他…」里输入名字即可筛选程序，Ctrl+F 重扫 PATH")
+        print("  Ctrl+F 搜索：TAB 换范围（名称 / 名称+路径 / 文件内容），支持 * ? 通配")
+        print("  :tab new|close|next|prev|list|1-9   :menu file   :dirprops 文件夹属性")
+        print("  :opts 文件夹显示选项（隐藏文件/隐藏扩展名/文件夹优先/排序/大小·日期·权限列）")
+        print("  ? 键位帮助   :about:preferences 设置   :about:config 原表   q 退出")
+        print("")
+        print("  示例:")
+        print("    python fileshredder.py /sdcard/Download")
+        print("    python fileshredder.py ~/File-Shredder-TUI")
+        print("    python fileshredder.py /sdcard/DCIM/Camera/IMG_001.jpg")
+        sys.exit(0)
+
+    start_note = ""
+    if args:
+        START_DIR, START_FILE, start_note = resolve_start_path(args[0])
+        if START_DIR is None:
+            # 整条路径都不可用（或参数为空），退回默认目录
+            start_note = (start_note + "；已改用默认目录") if start_note else "参数为空，已改用默认目录"
+
     if not os.path.exists("/storage/emulated/0"):
         print("[!] 先执行 termux-setup-storage 授权存储")
         sys.exit(1)
-    print("===== 镂空检测版：路径不存在只提示，不崩溃 =====")
+
+    # 首次运行：把默认配置落盘，方便用 cat / vim 直接看和改
+    if not os.path.exists(PREFS_FILE):
+        ok = save_prefs()
+        print(f"[*] 首次运行，已生成默认配置 {PREFS_FILE} ({'ok' if ok else '写入失败'})")
+        if not ok:
+            print("    目录不可写时设置只在本进程内生效")
+
+    print("===== 镂空检测 + shell history + 启动路径 + :preferences 版 =====")
+    if START_DIR:
+        print(f"[*] 起始目录: {START_DIR}")
+    if START_FILE:
+        print(f"[*] 预选文件: {START_FILE}")
+    if start_note:
+        print(f"[!] {start_note}")
+    print(f"[*] 启动路径策略: {PREFS.get('start_mode')} "
+          f"({START_MODE_LABELS.get(PREFS.get('start_mode'), '?')})")
+    print(f"[*] 配置文件: {PREFS_FILE}")
     print(f"[*] shell history 文件: {HISTORY_FILE}   (: 进入命令行后 ↑↓ 调取)")
     curses.wrapper(tui_main)
